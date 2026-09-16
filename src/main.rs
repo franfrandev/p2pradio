@@ -1,66 +1,116 @@
-mod stream;
-mod gossip_sub;
-mod swarm;
+mod cli;
+pub mod p2p;
+pub mod rpc;
 
-use libp2p::{gossipsub, mdns, noise, tcp, SwarmBuilder, swarm::{NetworkBehaviour, SwarmEvent}};
+use crate::cli::{Commands, HttpConversionError};
+use crate::p2p::swarm;
+use crate::rpc::{ServerType, start_rpc_server};
+use clap::Parser;
+use libp2p::kad::store::MemoryStore;
+use libp2p::{gossipsub, identify, kad, mdns, ping, swarm::NetworkBehaviour, tcp, yamux};
+use p2p::swarm::swarm_loop;
 use std::error::Error;
-use std::hash::{DefaultHasher, Hash, Hasher};
-use std::time::Duration;
+use thiserror::Error;
 use tokio::io;
+use tokio::{select, signal};
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
-#[derive(NetworkBehavior)]
+#[derive(NetworkBehaviour)]
 pub struct RadioBehavior {
+    identify: identify::Behaviour,
+    ping: ping::Behaviour,
     gossipsub: gossipsub::Behaviour,
     mdns: mdns::tokio::Behaviour,
+    kademlia: kad::Behaviour<MemoryStore>,
+}
+
+#[derive(Debug, Error)]
+pub enum AppError {
+    #[error(transparent)]
+    HttpConversionError(#[from] HttpConversionError),
+    #[error("io error: {0}")]
+    Io(#[from] io::Error),
+    #[error("app error: {0}")]
+    Other(String),
+    #[error("gossipsub radio error: {0}")]
+    GossipsubRadioError(#[from] p2p::gossip_sub::GossipSubRadioError),
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let _ = tracing_subscriber::fmt().with_env_filter(EnvFilter::from_default_env()).init();
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::from_default_env())
+        .init();
 
-    let mut swarm = SwarmBuilder::with_new_identity()
-        .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )?
-        .with_quic()
-        .with_behaviour(|key| {
-            // To content-address message, we can take the hash of message and use it as an ID.
-            let message_id_fn = |message: &gossipsub::Message| {
-                let mut s = DefaultHasher::new();
-                message.data.hash(&mut s);
-                gossipsub::MessageId::from(s.finish().to_string())
+    let cli = cli::Cli::parse();
+    tracing::debug!("cli: {:?}", cli);
+
+    let ctrl_c = signal::ctrl_c();
+
+    let cancel = CancellationToken::new();
+
+    select! {
+        _ = ctrl_c => {
+            tracing::debug!("ctrl-c received");
+            cancel.cancel();
+        }
+        res = run_program(cli, cancel.clone()) => {
+            match res {
+                Ok(_) => {
+                    tracing::error!("program finished");
+                }
+                Err(err) => {
+                    tracing::error!("program finished, reason: {}", err);
+                }
             };
+        }
+    }
 
-            // Set a custom gossipsub configuration
-            let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(10)) // This is set to aid debugging by not cluttering the log space
-                .validation_mode(gossipsub::ValidationMode::Strict) // This sets the kind of message validation. The default is Strict (enforce message
-                // signing)
-                .message_id_fn(message_id_fn) // content-address messages. No two messages of the same content will be propagated.
-                .build()
-                .map_err(io::Error::other)?; // Temporary hack because `build` does not return a proper `std::error::Error`.
+    Ok(())
+}
 
-            // build a gossipsub network behaviour
-            let gossipsub = gossipsub::Behaviour::new(
-                gossipsub::MessageAuthenticity::Signed(key.clone()),
-                gossipsub_config,
-            )?;
+async fn run_program(cli: cli::Cli, cancel: CancellationToken) -> Result<(), AppError> {
+    let swarm = {
+        let swarm = swarm::create_swarm()?;
+        let cancel = cancel.clone();
+        tokio::spawn(async move {
+            swarm_loop(swarm, cancel).await;
+            tracing::debug!("swarm loop stopped");
+        })
+    };
 
-            let mdns =
-                mdns::tokio::Behaviour::new(mdns::Config::default(), key.public().to_peer_id())?;
-            Ok(RadioBehavior { gossipsub, mdns })
-        })?
-        .build();
+    let rpc = {
+        let server_type = match cli.command {
+            Commands::Listener(..) => ServerType::Listener,
+            Commands::Streamer(..) => ServerType::Streamer,
+        };
+        let addr = cli.http().into_socket_addr().await?;
+        tracing::debug!("resolved socket addr: {}", addr);
 
-    let topic = gossipsub::IdentTopic::new("rock-it");
-    swarm.behaviour_mut().gossipsub.subscribe(&topic)?;
+        tokio::spawn(async move {
+            let (addr, server_handle) = start_rpc_server(server_type, addr).await?;
+            server_handle.stopped().await;
+            tracing::debug!("rpc server stopped");
+            Ok::<(), AppError>(())
+        })
+    };
 
-    swarm.listen_on("/ip4/0.0.0.0/tcp/0".parse()?)?;
-    swarm.listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse()?)?;
+    select! {
+        res = swarm => if let Err(err) = res {
+            tracing::error!("swarm task panic: {}", err);
+        },
+        tres = rpc => {
+            match tres {
+                Ok(res) => {
+                    res?;
+                    tracing::debug!("rpc task finished");
+                }
+                Err(err) => tracing::error!("rpc task panic: {}", err),
+            }
+        },
+        _ = cancel.cancelled() => (),
+    }
 
     Ok(())
 }
