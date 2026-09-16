@@ -1,0 +1,12 @@
+[package]
+name = "p2pradio"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+yamux = "0.14.0"
+tokio = { version = "1.53.1", features = ["full"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+libp2p = { version = "0.57.0", features = ["mdns", "gossipsub", "yamux", "quic", "tokio", "tcp", "noise"] }
+tokio-util = "0.7.19"
+tracing = "0.1.44"
