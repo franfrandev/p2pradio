@@ -1,12 +1,33 @@
-use crate::{AppError, RadioBehavior, RadioBehaviorEvent};
+use crate::AppError;
 use libp2p::futures::StreamExt;
+use libp2p::gossipsub::IdentTopic;
 use libp2p::kad::store::MemoryStore;
-use libp2p::swarm::SwarmEvent;
+use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{Swarm, SwarmBuilder, gossipsub, identify, kad, mdns, noise, ping, tcp, yamux};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
+use thiserror::Error;
 use tokio::io;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing_subscriber::registry::Data;
+
+#[derive(NetworkBehaviour)]
+pub struct RadioBehavior {
+    identify: identify::Behaviour,
+    ping: ping::Behaviour,
+    pub(crate) gossipsub: gossipsub::Behaviour,
+    mdns: mdns::tokio::Behaviour,
+    kademlia: kad::Behaviour<MemoryStore>,
+}
+
+#[derive(Debug, Error)]
+pub enum GossipError {
+    #[error(transparent)]
+    PublishError(#[from] gossipsub::PublishError),
+    #[error(transparent)]
+    SubscriptionError(#[from] gossipsub::SubscriptionError),
+}
 
 pub(crate) fn create_swarm() -> Result<Swarm<RadioBehavior>, AppError> {
     let mut swarm = SwarmBuilder::with_new_identity()
@@ -72,35 +93,67 @@ pub(crate) fn create_swarm() -> Result<Swarm<RadioBehavior>, AppError> {
     Ok(swarm)
 }
 
-pub async fn swarm_loop(mut swarm: Swarm<RadioBehavior>, cancel: CancellationToken) {
+pub async fn swarm_loop(
+    mut swarm: Swarm<RadioBehavior>,
+    topic: IdentTopic,
+    mut data_rx: mpsc::Receiver<Vec<u8>>,
+    gossip_tx: flume::Sender<Vec<u8>>,
+    cancel: CancellationToken,
+) {
     loop {
         tokio::select! {
             _ = cancel.cancelled() => break,
-            event = swarm.select_next_some() => process_event(&mut swarm, event),
+            data = data_rx.recv() => {
+                let Some(data) = data else { continue };
+                if let Err(err) = publish_data(&mut swarm, topic.clone(), data) {
+                    tracing::error!("Failed to publish data: {err}");
+                }
+            },
+            event = swarm.select_next_some() => process_event(&mut swarm, event, &gossip_tx),
         }
     }
 }
 
-fn process_event(swarm: &mut Swarm<RadioBehavior>, event: SwarmEvent<RadioBehaviorEvent>) {
+pub fn tune_in(swarm: &mut Swarm<RadioBehavior>, topic: &IdentTopic) -> Result<(), GossipError> {
+    swarm.behaviour_mut().gossipsub.subscribe(topic)?;
+    Ok(())
+}
+
+fn publish_data(
+    swarm: &mut Swarm<RadioBehavior>,
+    topic: IdentTopic,
+    data: Vec<u8>,
+) -> Result<(), GossipError> {
+    let _ = swarm.behaviour_mut().gossipsub.publish(topic, data)?;
+    Ok(())
+}
+
+fn process_event(
+    swarm: &mut Swarm<RadioBehavior>,
+    event: SwarmEvent<RadioBehaviorEvent>,
+    gossip_tx: &flume::Sender<Vec<u8>>,
+) {
     match event {
-        SwarmEvent::Behaviour(b_event) => process_behavior_event(swarm, b_event),
-        SwarmEvent::NewListenAddr {
-            listener_id,
-            address,
-        } => {
-            tracing::debug!("Listening on {address} with id: {listener_id}");
+        SwarmEvent::Behaviour(b_event) => process_behavior_event(swarm, b_event, gossip_tx),
+        _other => {
+            // tracing::debug!("Swarm Event not handled: {:?}", _other)
         }
-        _other => tracing::warn!("Swarm Event not handled: {:?}", _other),
     }
 }
 
-fn process_behavior_event(swarm: &mut Swarm<RadioBehavior>, b_event: RadioBehaviorEvent) {
+fn process_behavior_event(
+    swarm: &mut Swarm<RadioBehavior>,
+    b_event: RadioBehaviorEvent,
+    gossip_tx: &flume::Sender<Vec<u8>>,
+) {
     match b_event {
         RadioBehaviorEvent::Mdns(mdns_event) => process_mdns_event(swarm, mdns_event),
         RadioBehaviorEvent::Gossipsub(gossip_sub_event) => {
-            process_gossip_sub_event(swarm, gossip_sub_event)
+            process_gossip_sub_event(gossip_sub_event, gossip_tx)
         }
-        _other => tracing::warn!("Radio Behavior Event not handled: {:?}", _other),
+        _other => {
+            // tracing::debug!("Radio Behavior Event not handled: {:?}", _other)
+        }
     }
 }
 
@@ -108,13 +161,13 @@ pub fn process_mdns_event(swarm: &mut Swarm<RadioBehavior>, mdns_event: mdns::Ev
     match mdns_event {
         mdns::Event::Discovered(list) => {
             for (peer_id, _multiaddr) in list {
-                println!("mDNS discovered a new peer: {peer_id}");
+                tracing::debug!("mDNS discovered a new peer: {peer_id}");
                 swarm.behaviour_mut().gossipsub.add_explicit_peer(&peer_id);
             }
         }
         mdns::Event::Expired(list) => {
             for (peer_id, _multiaddr) in list {
-                println!("mDNS discover peer has expired: {peer_id}");
+                tracing::debug!("mDNS discover peer has expired: {peer_id}");
                 swarm
                     .behaviour_mut()
                     .gossipsub
@@ -125,18 +178,24 @@ pub fn process_mdns_event(swarm: &mut Swarm<RadioBehavior>, mdns_event: mdns::Ev
 }
 
 pub fn process_gossip_sub_event(
-    swarm: &mut Swarm<RadioBehavior>,
     gossip_sub_event: gossipsub::Event,
+    gossip_tx: &flume::Sender<Vec<u8>>,
 ) {
     match gossip_sub_event {
         gossipsub::Event::Message {
             propagation_source: peer_id,
             message_id: id,
             message,
-        } => println!(
-            "Got message: '{}' with id: {id} from peer: {peer_id}",
-            String::from_utf8_lossy(&message.data),
-        ),
-        _other => tracing::warn!("GossipSub Event not handled: {:?}", _other),
+        } => {
+            // TODO blacklist the peer if the source is not trusted
+            tracing::debug!(
+                "Got message: '{}' with id: {id} from peer: {peer_id}",
+                String::from_utf8_lossy(&message.data),
+            );
+            gossip_tx.send(message.data).unwrap();
+        }
+        _other => {
+            // tracing::debug!("GossipSub Event not handled: {:?}", _other)
+        }
     }
 }

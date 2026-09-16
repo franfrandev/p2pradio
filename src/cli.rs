@@ -1,5 +1,6 @@
-use std::fmt::Display;
 use clap::{Args, Parser, Subcommand};
+use libp2p::PeerId;
+use std::fmt::Display;
 use std::io;
 use std::str::FromStr;
 use thiserror::Error;
@@ -9,16 +10,18 @@ use tokio::net;
 #[command(version, about, long_about = None)]
 pub struct Cli {
     #[command(subcommand)]
-    pub(crate) command: Commands,
+    pub command: Commands,
 
     // #[arg(long, global = true, default_value_t = Http::default(), value_parser = clap::value_parser!(Http))]
     // pub(crate) http: Http,
-
     #[arg(long = "http.addr", global = true, default_value = "127.0.0.1")]
-    pub(crate) http_addr: String,
+    pub http_addr: String,
 
     #[arg(long = "http.port", global = true, default_value = "7890")]
-    pub(crate) http_port: u16,
+    pub http_port: u16,
+
+    #[arg(short, long, global = true)]
+    pub topic: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -30,10 +33,13 @@ pub enum Commands {
 }
 
 #[derive(Debug, Args)]
-pub(crate) struct Listener {}
+pub struct Listener {
+    #[arg(short, long)]
+    pub streamer_peer_id: PeerId,
+}
 
 #[derive(Debug, Args)]
-pub(crate) struct Streamer {}
+pub struct Streamer {}
 
 impl Cli {
     pub fn http(&self) -> Http {

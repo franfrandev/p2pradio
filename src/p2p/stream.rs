@@ -1,4 +1,4 @@
-/// Implementation of a buffered stream
+//! Implementation of a buffered stream mainly used for reconstructing data coming from GossipSub.
 
 use std::num::NonZeroU32;
 
