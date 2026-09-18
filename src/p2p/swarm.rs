@@ -1,16 +1,15 @@
 use crate::AppError;
 use libp2p::futures::StreamExt;
-use libp2p::gossipsub::IdentTopic;
+use libp2p::gossipsub::{IdentTopic, MessageId};
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
-use libp2p::{Swarm, SwarmBuilder, gossipsub, identify, kad, mdns, noise, ping, tcp, yamux};
-use std::hash::{DefaultHasher, Hash, Hasher};
+use libp2p::{Swarm, SwarmBuilder, gossipsub, identify, kad, mdns, ping};
+use rand::random;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::io;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing_subscriber::registry::Data;
 
 #[derive(NetworkBehaviour)]
 pub struct RadioBehavior {
@@ -32,12 +31,6 @@ pub enum GossipError {
 pub(crate) fn create_swarm() -> Result<Swarm<RadioBehavior>, AppError> {
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
-        .with_tcp(
-            tcp::Config::default(),
-            noise::Config::new,
-            yamux::Config::default,
-        )
-        .map_err(|err| AppError::Other(err.to_string()))? // TODO better typing
         .with_quic()
         .with_behaviour(|key| {
             let local_public_key = key.public();
@@ -50,16 +43,9 @@ pub(crate) fn create_swarm() -> Result<Swarm<RadioBehavior>, AppError> {
 
             let ping = ping::Behaviour::new(ping::Config::new());
 
-            let message_id_fn = |message: &gossipsub::Message| {
-                let mut s = DefaultHasher::new();
-                message.data.hash(&mut s);
-                gossipsub::MessageId::from(s.finish().to_string())
-            };
-
             let gossipsub_config = gossipsub::ConfigBuilder::default()
-                .heartbeat_interval(Duration::from_secs(10))
-                .validation_mode(gossipsub::ValidationMode::Strict) // TODO we only need source validation
-                .message_id_fn(message_id_fn)
+                .message_id_fn(message_id)
+                .validation_mode(gossipsub::ValidationMode::Strict)
                 .build()
                 .map_err(io::Error::other)?;
 
@@ -84,20 +70,24 @@ pub(crate) fn create_swarm() -> Result<Swarm<RadioBehavior>, AppError> {
         .build();
 
     swarm
-        .listen_on("/ip4/0.0.0.0/tcp/0".parse().unwrap())
-        .map_err(|err| AppError::Other(err.to_string()))?;
-    swarm
         .listen_on("/ip4/0.0.0.0/udp/0/quic-v1".parse().unwrap())
         .map_err(|err| AppError::Other(err.to_string()))?;
 
     Ok(swarm)
 }
 
+fn message_id(msg: &gossipsub::Message) -> MessageId {
+    let Some(seq_no) = msg.sequence_number else {
+        return MessageId::new(&[]);
+    };
+    MessageId::new(&seq_no.to_be_bytes())
+}
+
 pub async fn swarm_loop(
     mut swarm: Swarm<RadioBehavior>,
     topic: IdentTopic,
     mut data_rx: mpsc::Receiver<Vec<u8>>,
-    gossip_tx: flume::Sender<Vec<u8>>,
+    gossip_tx: Option<flume::Sender<Vec<u8>>>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -106,10 +96,10 @@ pub async fn swarm_loop(
             data = data_rx.recv() => {
                 let Some(data) = data else { continue };
                 if let Err(err) = publish_data(&mut swarm, topic.clone(), data) {
-                    tracing::error!("Failed to publish data: {err}");
+                    tracing::debug!("Failed to publish data: {err}");
                 }
             },
-            event = swarm.select_next_some() => process_event(&mut swarm, event, &gossip_tx),
+            event = swarm.select_next_some() => process_event(&mut swarm, event, &gossip_tx).await,
         }
     }
 }
@@ -128,28 +118,28 @@ fn publish_data(
     Ok(())
 }
 
-fn process_event(
+async fn process_event(
     swarm: &mut Swarm<RadioBehavior>,
     event: SwarmEvent<RadioBehaviorEvent>,
-    gossip_tx: &flume::Sender<Vec<u8>>,
+    gossip_tx: &Option<flume::Sender<Vec<u8>>>,
 ) {
     match event {
-        SwarmEvent::Behaviour(b_event) => process_behavior_event(swarm, b_event, gossip_tx),
+        SwarmEvent::Behaviour(b_event) => process_behavior_event(swarm, b_event, gossip_tx).await,
         _other => {
             // tracing::debug!("Swarm Event not handled: {:?}", _other)
         }
     }
 }
 
-fn process_behavior_event(
+async fn process_behavior_event(
     swarm: &mut Swarm<RadioBehavior>,
     b_event: RadioBehaviorEvent,
-    gossip_tx: &flume::Sender<Vec<u8>>,
+    gossip_tx: &Option<flume::Sender<Vec<u8>>>,
 ) {
     match b_event {
         RadioBehaviorEvent::Mdns(mdns_event) => process_mdns_event(swarm, mdns_event),
         RadioBehaviorEvent::Gossipsub(gossip_sub_event) => {
-            process_gossip_sub_event(gossip_sub_event, gossip_tx)
+            process_gossip_sub_event(gossip_sub_event, gossip_tx).await
         }
         _other => {
             // tracing::debug!("Radio Behavior Event not handled: {:?}", _other)
@@ -177,9 +167,9 @@ pub fn process_mdns_event(swarm: &mut Swarm<RadioBehavior>, mdns_event: mdns::Ev
     }
 }
 
-pub fn process_gossip_sub_event(
+pub async fn process_gossip_sub_event(
     gossip_sub_event: gossipsub::Event,
-    gossip_tx: &flume::Sender<Vec<u8>>,
+    gossip_tx: &Option<flume::Sender<Vec<u8>>>,
 ) {
     match gossip_sub_event {
         gossipsub::Event::Message {
@@ -188,11 +178,16 @@ pub fn process_gossip_sub_event(
             message,
         } => {
             // TODO blacklist the peer if the source is not trusted
-            tracing::debug!(
-                "Got message: '{}' with id: {id} from peer: {peer_id}",
-                String::from_utf8_lossy(&message.data),
-            );
-            gossip_tx.send(message.data).unwrap();
+            tracing::trace!("Got message with id: {id} from peer: {peer_id}",);
+            let Some(seq_no) = message.sequence_number else {
+                tracing::warn!("message seq no: None"); // TODO BLACKLIST
+                return;
+            };
+            // TODO reorder messages based on seq_no while buffering according to max wait in case of drops
+            tracing::debug!("message seq no: {seq_no}");
+            if let Some(gossip_tx) = gossip_tx {
+                gossip_tx.send_async(message.data).await.unwrap();
+            }
         }
         _other => {
             // tracing::debug!("GossipSub Event not handled: {:?}", _other)

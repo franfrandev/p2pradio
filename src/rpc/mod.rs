@@ -10,7 +10,7 @@ use hyper::header::CONTENT_TYPE;
 use hyper::service::service_fn;
 use hyper::{Response, StatusCode};
 use jsonrpsee::core::{RegisterMethodError, Serialize};
-use jsonrpsee::server::{ServerBuilder, ServerHandle};
+use jsonrpsee::server::{ServerBuilder, ServerHandle, serve};
 use libp2p::PeerId;
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -62,7 +62,8 @@ pub async fn start_rpc_server(
     address: SocketAddr,
     peer_id: PeerId,
     file_tx: Option<mpsc::Sender<(String, oneshot::Sender<Result<(), String>>)>>,
-    gossip_rx: flume::Receiver<Vec<u8>>,
+    gossip_rx: Option<flume::Receiver<Vec<u8>>>,
+    cancel: CancellationToken,
 ) -> Result<(SocketAddr, ServerHandle), RpcError> {
     let server = ServerBuilder::default().build(address).await?;
     let addr = server.local_addr()?;
@@ -70,7 +71,11 @@ pub async fn start_rpc_server(
     let mut methods = info::InfoRpcImpl { peer_id }.into_rpc();
 
     match server_type {
-        ServerType::Listener => methods.merge(listener::ListenerRpcImpl.into_rpc())?,
+        ServerType::Listener => {
+            let gossip_rx = gossip_rx.expect("should be defined for listener");
+            let (_handle, local_addr) = start_server(gossip_rx, cancel).await?;
+            methods.merge(listener::ListenerRpcImpl { local_addr }.into_rpc())?
+        }
         ServerType::Streamer => methods.merge(
             streamer::StreamerRpcImpl {
                 file_tx: file_tx.expect("file_tx must be provided for streamer server"),
@@ -79,10 +84,6 @@ pub async fn start_rpc_server(
         )?,
     };
 
-    tokio::spawn(async move {
-        start_server(gossip_rx).await.unwrap();
-    });
-
     let server_handle = server.start(methods);
 
     tracing::info!("RPC server started at {}", addr);
@@ -90,6 +91,7 @@ pub async fn start_rpc_server(
     Ok((addr, server_handle))
 }
 
+use crate::backend::DecodingBackend;
 use http::Request;
 use hyper::rt::{Sleep, Timer};
 use hyper::server::conn::http1;
@@ -101,7 +103,10 @@ use std::{
     task::{Context, Poll},
     time::{Duration, Instant},
 };
+use tokio::task::JoinHandle;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
+use tracing::log;
 
 #[derive(Clone)]
 /// An Executor that uses the tokio runtime.
@@ -326,35 +331,62 @@ where
 
 async fn start_server(
     gossip_rx: flume::Receiver<Vec<u8>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    cancel: CancellationToken,
+) -> Result<(JoinHandle<Result<(), RpcError>>, SocketAddr), RpcError> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let listener = TcpListener::bind(addr).await?;
-    tracing::info!("Listening on {}", listener.local_addr()?);
+    let local_addr = listener.local_addr()?;
+    tracing::info!("Listening on {}", local_addr);
 
+    let (stream_tx, stream_rx) = flume::unbounded();
+
+    let cancel_ = cancel.clone();
+    let backend = tokio::spawn(async move {
+        tracing::debug!("Starting decoding backend");
+        let back = DecodingBackend::new(gossip_rx, stream_tx);
+        let res = back.run(cancel_).await;
+        tracing::error!("Backend finished with result: {:?}", res);
+        res
+    });
+
+    let handle = tokio::spawn(async move { server_listener(listener, stream_rx.clone()).await });
+
+    Ok((handle, local_addr))
+}
+
+async fn server_listener(
+    listener: TcpListener,
+    stream_rx: flume::Receiver<Vec<u8>>,
+) -> Result<(), RpcError> {
     loop {
         let (stream, _) = listener.accept().await?;
+        log::debug!("Accepted connection: {:?}", stream.peer_addr());
+        let stream_rx = stream_rx.clone();
+        tokio::spawn(async move {
+            let io = TokioIo::new(stream);
 
-        let io = TokioIo::new(stream);
-
-        if let Err(err) = http1::Builder::new()
-            .serve_connection(
-                io,
-                service_fn(|req| async { response_stream(req, gossip_rx.clone()).await }),
-            )
-            .await
-        {
-            eprintln!("Error serving connection: {:?}", err);
-        }
+            if let Err(err) = http1::Builder::new()
+                .serve_connection(
+                    io,
+                    service_fn(|req| async { response_stream(req, stream_rx.clone()).await }),
+                )
+                .await
+            {
+                eprintln!("Error serving connection: {:?}", err);
+            }
+        });
     }
 }
 
 pub async fn response_stream(
     req: Request<Incoming>,
-    gossip_rx: flume::Receiver<Vec<u8>>,
+    stream_rx: flume::Receiver<Vec<u8>>,
 ) -> hyper::Result<Response<BoxBody<Bytes, Infallible>>> {
-    let stream = gossip_rx.into_stream();
+    tracing::debug!("Received request: {:?}", req);
+    let stream = stream_rx.into_stream();
     let stream = stream.map(|item| {
+        tracing::trace!("Received item: {:?}", item.len());
         let b = Bytes::from(item);
         let f = Frame::data(b);
         Ok(f)

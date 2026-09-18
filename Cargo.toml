@@ -3,6 +3,9 @@ name = "p2pradio"
 version = "0.1.0"
 edition = "2024"
 
+[profile.test]
+panic = "abort"
+
 [dependencies]
 tokio = { version = "1.53.1", features = ["full"] }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
@@ -28,6 +31,14 @@ futures-util = "0.3.34"
 pin-project-lite = "0.2.17"
 tokio-stream = "0.1.19"
 flume = "0.12.0"
+rand = "0.10.2"
+byte-slice-cast = "1.2.3"
+derive_more = { version = "2.1.1", features = ["full"] }
+glib = "0.22.9"
+gstreamer-audio = "0.25.3"
+tracing-gstreamer = "0.9.0"
+futures = "0.3.34"
+console-subscriber = "0.5.0"
 
 [dev-dependencies]
 anyhow = "1.0.104"

@@ -1,4 +1,4 @@
-use crate::backend::Backend;
+use crate::backend::EncodingBackend;
 use crate::cli::Commands;
 use crate::p2p::swarm;
 use crate::p2p::swarm::{swarm_loop, tune_in};
@@ -25,7 +25,12 @@ impl Node {
         let mut swarm = swarm::create_swarm()?;
         let peer_id = *swarm.local_peer_id();
         let (data_tx, data_rx) = mpsc::channel(1000);
-        let (gossip_tx, gossip_rx) = flume::unbounded();
+        let (gossip_tx, gossip_rx) = if matches!(cli.command, Commands::Listener(..)) {
+            let (tx, rx) = flume::unbounded();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
         let swarm = {
             let cancel = cancel.clone();
             let topic = IdentTopic::new(cli.topic.to_string());
@@ -53,9 +58,17 @@ impl Node {
                 .map(|(tx, rx)| (Some(tx), Some(rx)))
                 .unwrap_or((None, None));
 
+            let cancel_ = cancel.clone();
             let rpc = tokio::spawn(async move {
-                let (addr, server_handle) =
-                    start_rpc_server(server_type, addr, peer_id, maybe_file_tx, gossip_rx).await?;
+                let (addr, server_handle) = start_rpc_server(
+                    server_type,
+                    addr,
+                    peer_id,
+                    maybe_file_tx,
+                    gossip_rx,
+                    cancel_,
+                )
+                .await?;
                 tx.send(addr).expect("unreachable");
                 server_handle.stopped().await;
                 tracing::debug!("rpc server stopped");
@@ -69,7 +82,7 @@ impl Node {
             .map_err(|_| AppError::Other("failed to start rpc server".to_string()))?;
 
         let backend = {
-            let backend = Backend::new(data_tx, maybe_file_rx);
+            let backend = EncodingBackend::new(data_tx, maybe_file_rx);
 
             let cancel = cancel.clone();
             tokio::spawn(async move {
