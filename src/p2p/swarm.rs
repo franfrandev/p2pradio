@@ -4,8 +4,6 @@ use libp2p::gossipsub::{IdentTopic, MessageId};
 use libp2p::kad::store::MemoryStore;
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{Swarm, SwarmBuilder, gossipsub, identify, kad, mdns, ping};
-use rand::random;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::io;
 use tokio::sync::mpsc;

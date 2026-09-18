@@ -1,23 +1,36 @@
+use crate::backend::DecodingBackend;
 use crate::rpc::info::InfoRpcServer;
 use crate::rpc::listener::ListenerRpcServer;
 use crate::rpc::streamer::StreamerRpcServer;
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
+use http::Request;
 use http_body_util::StreamBody;
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Frame, Incoming};
 use hyper::header::CONTENT_TYPE;
+use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Response, StatusCode};
-use jsonrpsee::core::{RegisterMethodError, Serialize};
-use jsonrpsee::server::{ServerBuilder, ServerHandle, serve};
+use io::{AsyncRead, AsyncWrite};
+use jsonrpsee::core::RegisterMethodError;
+use jsonrpsee::server::{ServerBuilder, ServerHandle};
 use libp2p::PeerId;
+use pin_project_lite::pin_project;
 use std::convert::Infallible;
 use std::net::SocketAddr;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
 use thiserror::Error;
-use tokio::io;
+use tokio::io::ReadBuf;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio::{io, select};
+use tokio_util::sync::CancellationToken;
+use tracing::log;
 
 mod info;
 mod listener;
@@ -73,7 +86,7 @@ pub async fn start_rpc_server(
     match server_type {
         ServerType::Listener => {
             let gossip_rx = gossip_rx.expect("should be defined for listener");
-            let (_handle, local_addr) = start_server(gossip_rx, cancel).await?;
+            let (_handle, _backend, local_addr) = start_server(gossip_rx, cancel).await?;
             methods.merge(listener::ListenerRpcImpl { local_addr }.into_rpc())?
         }
         ServerType::Streamer => methods.merge(
@@ -89,98 +102,6 @@ pub async fn start_rpc_server(
     tracing::info!("RPC server started at {}", addr);
 
     Ok((addr, server_handle))
-}
-
-use crate::backend::DecodingBackend;
-use http::Request;
-use hyper::rt::{Sleep, Timer};
-use hyper::server::conn::http1;
-use pin_project_lite::pin_project;
-use std::sync::{Arc, Mutex};
-use std::{
-    future::Future,
-    pin::Pin,
-    task::{Context, Poll},
-    time::{Duration, Instant},
-};
-use tokio::task::JoinHandle;
-use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::CancellationToken;
-use tracing::log;
-
-#[derive(Clone)]
-/// An Executor that uses the tokio runtime.
-pub struct TokioExecutor;
-
-impl<F> hyper::rt::Executor<F> for TokioExecutor
-where
-    F: std::future::Future + Send + 'static,
-    F::Output: Send + 'static,
-{
-    fn execute(&self, fut: F) {
-        tokio::task::spawn(fut);
-    }
-}
-
-/// A Timer that uses the tokio runtime.
-
-#[derive(Clone, Debug)]
-pub struct TokioTimer;
-
-impl Timer for TokioTimer {
-    fn sleep(&self, duration: Duration) -> Pin<Box<dyn Sleep>> {
-        Box::pin(TokioSleep {
-            inner: tokio::time::sleep(duration),
-        })
-    }
-
-    fn sleep_until(&self, deadline: Instant) -> Pin<Box<dyn Sleep>> {
-        Box::pin(TokioSleep {
-            inner: tokio::time::sleep_until(deadline.into()),
-        })
-    }
-
-    fn now(&self) -> Instant {
-        tokio::time::Instant::now().into()
-    }
-
-    fn reset(&self, sleep: &mut Pin<Box<dyn Sleep>>, new_deadline: Instant) {
-        if let Some(sleep) = sleep.as_mut().downcast_mut_pin::<TokioSleep>() {
-            sleep.reset(new_deadline)
-        }
-    }
-}
-
-impl TokioTimer {
-    /// Create a new TokioTimer
-    pub fn new() -> Self {
-        Self {}
-    }
-}
-
-// Use TokioSleep to get tokio::time::Sleep to implement Unpin.
-// see https://docs.rs/tokio/latest/tokio/time/struct.Sleep.html
-pin_project! {
-    pub(crate) struct TokioSleep {
-        #[pin]
-        pub(crate) inner: tokio::time::Sleep,
-    }
-}
-
-impl Future for TokioSleep {
-    type Output = ();
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.project().inner.poll(cx)
-    }
-}
-
-impl Sleep for TokioSleep {}
-
-impl TokioSleep {
-    pub fn reset(self: Pin<&mut Self>, deadline: Instant) {
-        self.project().inner.as_mut().reset(deadline.into());
-    }
 }
 
 pin_project! {
@@ -203,16 +124,16 @@ impl<T> TokioIo<T> {
 
 impl<T> hyper::rt::Read for TokioIo<T>
 where
-    T: tokio::io::AsyncRead,
+    T: AsyncRead,
 {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         mut buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    ) -> Poll<Result<(), io::Error>> {
         let n = unsafe {
-            let mut tbuf = tokio::io::ReadBuf::uninit(buf.as_mut());
-            match tokio::io::AsyncRead::poll_read(self.project().inner, cx, &mut tbuf) {
+            let mut tbuf = ReadBuf::uninit(buf.as_mut());
+            match AsyncRead::poll_read(self.project().inner, cx, &mut tbuf) {
                 Poll::Ready(Ok(())) => tbuf.filled().len(),
                 other => return other,
             }
@@ -227,49 +148,46 @@ where
 
 impl<T> hyper::rt::Write for TokioIo<T>
 where
-    T: tokio::io::AsyncWrite,
+    T: AsyncWrite,
 {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        tokio::io::AsyncWrite::poll_write(self.project().inner, cx, buf)
+    ) -> Poll<Result<usize, io::Error>> {
+        AsyncWrite::poll_write(self.project().inner, cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
-        tokio::io::AsyncWrite::poll_flush(self.project().inner, cx)
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        AsyncWrite::poll_flush(self.project().inner, cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
-        tokio::io::AsyncWrite::poll_shutdown(self.project().inner, cx)
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
+        AsyncWrite::poll_shutdown(self.project().inner, cx)
     }
 
     fn is_write_vectored(&self) -> bool {
-        tokio::io::AsyncWrite::is_write_vectored(&self.inner)
+        AsyncWrite::is_write_vectored(&self.inner)
     }
 
     fn poll_write_vectored(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
-    ) -> Poll<Result<usize, std::io::Error>> {
-        tokio::io::AsyncWrite::poll_write_vectored(self.project().inner, cx, bufs)
+    ) -> Poll<Result<usize, io::Error>> {
+        AsyncWrite::poll_write_vectored(self.project().inner, cx, bufs)
     }
 }
 
-impl<T> tokio::io::AsyncRead for TokioIo<T>
+impl<T> AsyncRead for TokioIo<T>
 where
     T: hyper::rt::Read,
 {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        tbuf: &mut tokio::io::ReadBuf<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+        tbuf: &mut ReadBuf<'_>,
+    ) -> Poll<Result<(), io::Error>> {
         //let init = tbuf.initialized().len();
         let filled = tbuf.filled().len();
         let sub_filled = unsafe {
@@ -293,7 +211,7 @@ where
     }
 }
 
-impl<T> io::AsyncWrite for TokioIo<T>
+impl<T> AsyncWrite for TokioIo<T>
 where
     T: hyper::rt::Write,
 {
@@ -301,18 +219,15 @@ where
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
         buf: &[u8],
-    ) -> Poll<Result<usize, std::io::Error>> {
+    ) -> Poll<Result<usize, io::Error>> {
         hyper::rt::Write::poll_write(self.project().inner, cx, buf)
     }
 
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         hyper::rt::Write::poll_flush(self.project().inner, cx)
     }
 
-    fn poll_shutdown(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Result<(), std::io::Error>> {
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
         hyper::rt::Write::poll_shutdown(self.project().inner, cx)
     }
 
@@ -332,7 +247,14 @@ where
 async fn start_server(
     gossip_rx: flume::Receiver<Vec<u8>>,
     cancel: CancellationToken,
-) -> Result<(JoinHandle<Result<(), RpcError>>, SocketAddr), RpcError> {
+) -> Result<
+    (
+        JoinHandle<Result<(), RpcError>>,
+        JoinHandle<Result<(), anyhow::Error>>,
+        SocketAddr,
+    ),
+    RpcError,
+> {
     let addr = SocketAddr::from(([127, 0, 0, 1], 0));
 
     let listener = TcpListener::bind(addr).await?;
@@ -350,32 +272,40 @@ async fn start_server(
         res
     });
 
-    let handle = tokio::spawn(async move { server_listener(listener, stream_rx.clone()).await });
+    let handle =
+        tokio::spawn(async move { server_listener(listener, stream_rx.clone(), cancel).await });
 
-    Ok((handle, local_addr))
+    Ok((handle, backend, local_addr))
 }
 
 async fn server_listener(
     listener: TcpListener,
     stream_rx: flume::Receiver<Vec<u8>>,
+    cancel: CancellationToken,
 ) -> Result<(), RpcError> {
     loop {
-        let (stream, _) = listener.accept().await?;
-        log::debug!("Accepted connection: {:?}", stream.peer_addr());
-        let stream_rx = stream_rx.clone();
-        tokio::spawn(async move {
-            let io = TokioIo::new(stream);
+        select! {
+            Ok((stream, _)) = listener.accept() => {
+                log::debug!("Accepted connection: {:?}", stream.peer_addr());
+                let stream_rx = stream_rx.clone();
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
 
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(
-                    io,
-                    service_fn(|req| async { response_stream(req, stream_rx.clone()).await }),
-                )
-                .await
-            {
-                eprintln!("Error serving connection: {:?}", err);
+                    if let Err(err) = http1::Builder::new()
+                        .serve_connection(
+                            io,
+                            service_fn(|req| async { response_stream(req, stream_rx.clone()).await }),
+                        )
+                        .await
+                    {
+                        eprintln!("Error serving connection: {:?}", err);
+                    }
+                });
             }
-        });
+            _ = cancel.cancelled() => {
+                return Ok(());
+            }
+        }
     }
 }
 

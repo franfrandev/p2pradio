@@ -15,15 +15,10 @@ tracing = "0.1.44"
 clap = { version = "4.6.1", features = ["derive"] }
 jsonrpsee = { version = "0.26.0", features = ["full"] }
 thiserror = "2.0.20"
-chrono = "0.4.45"
 gstreamer = "0.25.3"
 gstreamer-app = "0.25.2"
-gstreamer-pbutils = { version = "0.25.2", features = ["v1_20"] }
-gst-plugin-isobmff = "0.15.3"
-m3u8-rs = "6.0.1"
 anyhow = "1.0.104"
 http = "1.5.0"
-serde_json = "1.0.151"
 hyper = "1.11.1"
 bytes = "1.12.1"
 http-body-util = "0.1.5"
@@ -31,14 +26,12 @@ futures-util = "0.3.34"
 pin-project-lite = "0.2.17"
 tokio-stream = "0.1.19"
 flume = "0.12.0"
-rand = "0.10.2"
 byte-slice-cast = "1.2.3"
 derive_more = { version = "2.1.1", features = ["full"] }
 glib = "0.22.9"
-gstreamer-audio = "0.25.3"
 tracing-gstreamer = "0.9.0"
 futures = "0.3.34"
-console-subscriber = "0.5.0"
+# console-subscriber = "0.5.0"
 
 [dev-dependencies]
 anyhow = "1.0.104"

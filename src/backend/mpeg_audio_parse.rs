@@ -3,14 +3,13 @@
 // The pipeline also has an app sink which allows then sampling these frames to write them into a buffer.
 // https://gstreamer.freedesktop.org/documentation/audioparsers/mpegaudioparse.html?gi-language=c#mpegaudioparse-page
 
-use anyhow::{Error, anyhow};
+use anyhow::{Error};
 use byte_slice_cast::AsSliceOf;
 use derive_more::{Display, Error};
 use gstreamer as gst;
 use gstreamer::element_error;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
-use std::env;
 use tokio::select;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -23,7 +22,7 @@ pub struct EmptyStream {
 
 pub struct StreamWithPipeline {
     pipeline: gst::Pipeline,
-    rx: flume::Receiver<Vec<u8>>,
+    sink_rx: flume::Receiver<Vec<u8>>,
 }
 
 pub struct Stream<S> {
@@ -75,15 +74,11 @@ impl Stream<EmptyStream> {
         pipeline.add_many(elements)?;
         gst::Element::link_many(elements)?;
 
-        let (tx, rx) = flume::bounded(100);
+        let (sink_tx, sink_rx) = flume::bounded(100);
 
-        // Getting data out of the appsink is done by setting callbacks on it.
-        // The appsink will then call those handlers, as soon as data is available.
         appsink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
-                // Add a handler to the "new-sample" signal.
                 .new_sample(move |appsink| {
-                    // Pull the sample in question out of the appsink's buffer.
                     let sample = appsink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let buffer = sample.buffer().ok_or_else(|| {
                         element_error!(
@@ -95,13 +90,6 @@ impl Stream<EmptyStream> {
                         gst::FlowError::Error
                     })?;
 
-                    // At this point, buffer is only a reference to an existing memory region somewhere.
-                    // When we want to access its content, we have to map it while requesting the required
-                    // mode of access (read, read/write).
-                    // This type of abstraction is necessary, because the buffer in question might not be
-                    // on the machine's main memory itself, but rather in the GPU's memory.
-                    // So mapping the buffer makes the underlying memory region accessible to us.
-                    // See: https://gstreamer.freedesktop.org/documentation/plugin-development/advanced/allocation.html
                     let map = buffer.map_readable().map_err(|_| {
                         element_error!(
                             appsink,
@@ -112,9 +100,6 @@ impl Stream<EmptyStream> {
                         gst::FlowError::Error
                     })?;
 
-                    // We know what format the data in the memory region has, since we requested
-                    // it by setting the appsink's caps. So what we do here is interpret the
-                    // memory region we mapped as an array of signed 16 bit integers.
                     let samples = map.as_slice_of::<u8>().map_err(|_| {
                         element_error!(
                             appsink,
@@ -128,7 +113,7 @@ impl Stream<EmptyStream> {
                     tracing::trace!("samples: {:?}", samples);
                     tracing::debug!("samples: {}", samples.len());
 
-                    if tx.send(samples.to_vec()).is_err() {
+                    if sink_tx.send(samples.to_vec()).is_err() {
                         tracing::error!(
                             "Failed to send samples, expect loss. samples: {}",
                             samples.len()
@@ -143,7 +128,7 @@ impl Stream<EmptyStream> {
         tracing::debug!("Encoding pipeline created");
 
         Ok(Stream::<StreamWithPipeline> {
-            state: StreamWithPipeline { pipeline, rx },
+            state: StreamWithPipeline { pipeline, sink_rx },
         })
     }
 }
@@ -192,8 +177,8 @@ impl Stream<StreamWithPipeline> {
         Ok(())
     }
 
-    pub fn rx(&self) -> flume::Receiver<Vec<u8>> {
-        self.state.rx.clone()
+    pub fn sink_rx(&self) -> flume::Receiver<Vec<u8>> {
+        self.state.sink_rx.clone()
     }
 }
 
@@ -237,11 +222,10 @@ mod tests {
 
         init_gst()?;
 
-        let empty_stream = new_empty_stream(
-            "/home/francois/RustroverProjects/p2pradio/tests/Unknown_Brother.mp3".to_string(),
-        );
+        let root = env!("CARGO_MANIFEST_DIR");
+        let empty_stream = new_empty_stream(format!("{}/tests/file_example_MP3_700KB.mp3", root));
         let stream_with_pipeline = empty_stream.create_pipeline()?;
-        let rx = stream_with_pipeline.rx();
+        let rx = stream_with_pipeline.sink_rx();
         let cancel = CancellationToken::new();
         let cancel_ = cancel.clone();
         tokio::spawn(async move {

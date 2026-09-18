@@ -12,7 +12,6 @@ use gstreamer::bus::BusStream;
 use gstreamer::element_error;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
-use gstreamer_audio as gst_audio;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -249,11 +248,12 @@ mod tests {
 
         init_gst()?;
 
+        let root = env!("CARGO_MANIFEST_DIR");
         let empty_stream = crate::backend::mpeg_audio_parse::new_empty_stream(
-            "/home/francois/RustroverProjects/p2pradio/tests/Unknown_Brother.mp3".to_string(),
+            format!("{}/tests/file_example_MP3_700KB.mp3", root),
         );
         let stream_with_pipeline = empty_stream.create_pipeline()?;
-        let mpeg_rx = stream_with_pipeline.rx();
+        let mpeg_rx = stream_with_pipeline.sink_rx();
         let cancel = CancellationToken::new();
         let cancel_ = cancel.clone();
         tokio::spawn(async move {

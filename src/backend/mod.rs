@@ -11,7 +11,6 @@ use crate::backend::mpeg_dec::new_empty_dec_stream;
 use anyhow::Context;
 use std::path::Path;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
@@ -63,7 +62,7 @@ impl EncodingBackend {
         let empty_stream = new_empty_stream(file_path);
         let stream_with_pipeline = empty_stream.create_pipeline().map_err(|e| e.to_string())?;
         tracing::debug!("Encoding pipeline created OK");
-        let rx = stream_with_pipeline.rx();
+        let rx = stream_with_pipeline.sink_rx();
         tracing::debug!("Will start encoding main loop");
         tokio::spawn(async move {
             tracing::debug!("Now start encoding main loop");

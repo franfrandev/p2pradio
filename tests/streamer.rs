@@ -33,8 +33,9 @@ async fn streamer() -> Result<(), Box<dyn Error>> {
 
     let tmp_dir = TempDir::new()?;
     let file_path = tmp_dir.path().join("my_music.mp3");
+    let root = env!("CARGO_MANIFEST_DIR");
     fs::copy(
-        "/home/francois/RustroverProjects/p2pradio/tests/Unknown_Brother.mp3",
+        format!("{}/tests/file_example_MP3_700KB.mp3", root),
         file_path.clone(),
     )
     .await?;
