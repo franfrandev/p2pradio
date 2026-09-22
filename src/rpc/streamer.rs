@@ -11,10 +11,14 @@ use tracing::{Instrument, debug_span};
 pub trait StreamerRpc {
     #[method(name = "broadcastFile")]
     async fn broadcast_file(&self, path: String) -> RpcResult<()>;
+
+    #[method(name = "broadcastIcecast")]
+    async fn broadcast_icecast(&self, url: String) -> RpcResult<()>;
 }
 
 pub struct StreamerRpcImpl {
     pub file_tx: mpsc::Sender<(String, oneshot::Sender<Result<(), String>>)>,
+    pub url_tx: mpsc::Sender<(String, oneshot::Sender<Result<(), String>>)>,
 }
 
 #[async_trait]
@@ -42,6 +46,38 @@ impl StreamerRpcServer for StreamerRpcImpl {
                 ErrorObject::owned(rpc_err::FILE_ERR, "failed to buffer file", Some(err))
             })?;
             tracing::debug!("broadcast complete");
+            Ok(())
+        }
+        .instrument(span)
+        .await
+    }
+
+    async fn broadcast_icecast(&self, url: String) -> RpcResult<()> {
+        let span = debug_span!("broadcast_icecast", url);
+        async move {
+            tracing::debug!("starting icecast broadcast");
+            let (tx, rx) = oneshot::channel();
+            self.url_tx.send((url, tx)).await.map_err(|_| {
+                ErrorObject::owned::<()>(
+                    rpc_err::FAILED_SEND_FILE_REF,
+                    "failed to send icecast broadcast",
+                    None,
+                )
+            })?;
+            let feedback = rx.await.map_err(|_| {
+                ErrorObject::owned::<()>(
+                    rpc_err::FAILED_RECV_FILE_FEED,
+                    "failed to receive icecast feedback",
+                    None,
+                )
+            })?;
+            feedback.map_err(|err| {
+                ErrorObject::owned(
+                    rpc_err::FILE_ERR,
+                    "failed to send icecast broadcast",
+                    Some(err),
+                )
+            })?;
             Ok(())
         }
         .instrument(span)

@@ -1,4 +1,4 @@
-use crate::backend::DecodingBackend;
+use crate::backend::{DecodingBackend, OggHeaders};
 use crate::rpc::info::InfoRpcServer;
 use crate::rpc::listener::ListenerRpcServer;
 use crate::rpc::streamer::StreamerRpcServer;
@@ -26,9 +26,11 @@ use std::{
 use thiserror::Error;
 use tokio::io::ReadBuf;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::{io, select};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_util::sync::CancellationToken;
 use tracing::log;
 
@@ -75,6 +77,7 @@ pub async fn start_rpc_server(
     address: SocketAddr,
     peer_id: PeerId,
     file_tx: Option<mpsc::Sender<(String, oneshot::Sender<Result<(), String>>)>>,
+    url_tx: Option<mpsc::Sender<(String, oneshot::Sender<Result<(), String>>)>>,
     gossip_rx: Option<flume::Receiver<Vec<u8>>>,
     cancel: CancellationToken,
 ) -> Result<(SocketAddr, ServerHandle), RpcError> {
@@ -92,6 +95,7 @@ pub async fn start_rpc_server(
         ServerType::Streamer => methods.merge(
             streamer::StreamerRpcImpl {
                 file_tx: file_tx.expect("file_tx must be provided for streamer server"),
+                url_tx: url_tx.expect("url_tx must be provided for streamer server"),
             }
             .into_rpc(),
         )?,
@@ -255,46 +259,52 @@ async fn start_server(
     ),
     RpcError,
 > {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    // let addr = SocketAddr::from(([127, 0, 0, 1], 0));
+    let addr = SocketAddr::from(([127, 0, 0, 1], 10909));
 
     let listener = TcpListener::bind(addr).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!("Listening on {}", local_addr);
 
-    let (stream_tx, stream_rx) = flume::unbounded();
+    let (dec_tx, _) = broadcast::channel(100);
+    let headers = OggHeaders::default();
 
     let cancel_ = cancel.clone();
+    let dec_tx2 = dec_tx.clone();
+    let headers2 = headers.clone();
     let backend = tokio::spawn(async move {
         tracing::debug!("Starting decoding backend");
-        let back = DecodingBackend::new(gossip_rx, stream_tx);
+        let back = DecodingBackend::new(gossip_rx, dec_tx2, headers2);
         let res = back.run(cancel_).await;
         tracing::error!("Backend finished with result: {:?}", res);
         res
     });
 
     let handle =
-        tokio::spawn(async move { server_listener(listener, stream_rx.clone(), cancel).await });
+        tokio::spawn(async move { server_listener(listener, dec_tx, headers, cancel).await });
 
     Ok((handle, backend, local_addr))
 }
 
 async fn server_listener(
     listener: TcpListener,
-    stream_rx: flume::Receiver<Vec<u8>>,
+    dec_tx: broadcast::Sender<Vec<u8>>,
+    headers: OggHeaders,
     cancel: CancellationToken,
 ) -> Result<(), RpcError> {
     loop {
         select! {
             Ok((stream, _)) = listener.accept() => {
                 log::debug!("Accepted connection: {:?}", stream.peer_addr());
-                let stream_rx = stream_rx.clone();
+                let dec_tx = dec_tx.clone();
+                let headers = headers.clone();
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
 
                     if let Err(err) = http1::Builder::new()
                         .serve_connection(
                             io,
-                            service_fn(|req| async { response_stream(req, stream_rx.clone()).await }),
+                            service_fn(|req| async { response_stream(req, &dec_tx, &headers).await }),
                         )
                         .await
                     {
@@ -311,22 +321,65 @@ async fn server_listener(
 
 pub async fn response_stream(
     req: Request<Incoming>,
-    stream_rx: flume::Receiver<Vec<u8>>,
+    dec_tx: &broadcast::Sender<Vec<u8>>,
+    headers: &OggHeaders,
 ) -> hyper::Result<Response<BoxBody<Bytes, Infallible>>> {
     tracing::debug!("Received request: {:?}", req);
-    let stream = stream_rx.into_stream();
-    let stream = stream.map(|item| {
-        tracing::trace!("Received item: {:?}", item.len());
-        let b = Bytes::from(item);
-        let f = Frame::data(b);
-        Ok(f)
+    // Snapshot the headers and subscribe under the same lock, so that header pages
+    // are neither missed nor duplicated if the decoder is emitting them right now.
+    let (headers, rx) = {
+        let headers = headers.lock().expect("headers lock poisoned");
+        (headers.clone(), dec_tx.subscribe())
+    };
+    let live = BroadcastStream::new(rx).filter_map(|item| async move {
+        match item {
+            Ok(item) => {
+                tracing::trace!("Received item: {:?}", item.len());
+                Some(item)
+            }
+            // A slow client skips pages rather than being disconnected.
+            Err(BroadcastStreamRecvError::Lagged(n)) => {
+                tracing::warn!("HTTP client lagged, skipped {} pages", n);
+                None
+            }
+        }
     });
+    let stream = futures_util::stream::iter(headers)
+        .chain(live)
+        .map(|item| Ok(Frame::data(Bytes::from(item))));
     let stream = StreamBody::new(stream);
     let body = BoxBody::new(stream);
 
+    // TODO keep track of icecast headers
+    // Server: Icecast 2.4.4
+    // Connection: Close
+    // Date: Tue, 22 Sep 2026 19:03:37 GMT
+    // Content-Type: application/ogg
+    // Cache-Control: no-cache, no-store
+    // Expires: Mon, 26 Jul 1997 05:00:00 GMT
+    // Pragma: no-cache
+    // Access-Control-Allow-Origin: *
+    // ice-audio-info: channels=2;quality=0.8;samplerate=44100
+    // icy-description:LibreTime Radio!
+    // icy-genre:various
+    // icy-name:LibreTime!
+    // icy-pub:1
+    // icy-url:https://libretime.org
     let res = Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "audio/mpeg")
+        // .header("Server", "Icecast 2.4.4")
+        // .header("Connection", "Close")
+        // .header("Date", "Tue, 22 Sep 2026 19:03:37 GMT")
+        .header(CONTENT_TYPE, "audio/ogg")
+        // .header(CONTENT_TYPE, "audio/x-raw")
+        // .header("Pragma", "no-cache")
+        // .header("Access-Control-Allow-Origin", "*")
+        // .header("ice-audio-info", "channels=2;quality=0.8;samplerate=44100")
+        // .header("icy-description", "My RPC Radio!")
+        // .header("icy-genre", "Cool shit")
+        // .header("icy-name", "RADOP")
+        // .header("icy-pub", "1")
+        // .header("icy-url", "https://libretime.org")
         .body(body)
         .expect("Failed to build Response");
 

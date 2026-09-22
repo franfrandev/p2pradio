@@ -21,7 +21,7 @@ pub struct Cli {
     pub http_port: u16,
 
     #[arg(short, long, global = true)]
-    pub topic: String,
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]

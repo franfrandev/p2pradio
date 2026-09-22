@@ -17,16 +17,16 @@ use tracing::instrument;
 use tracing_gstreamer as tracing_gst;
 
 pub struct EmptyStream {
-    file: String,
+    pub(crate) file: String,
 }
 
 pub struct StreamWithPipeline {
-    pipeline: gst::Pipeline,
-    sink_rx: flume::Receiver<Vec<u8>>,
+    pub(crate) pipeline: gst::Pipeline,
+    pub(crate) sink_rx: flume::Receiver<Vec<u8>>,
 }
 
 pub struct Stream<S> {
-    state: S,
+    pub state: S,
 }
 
 #[derive(Debug, Display, Error)]
@@ -53,7 +53,7 @@ pub fn init_gst() -> anyhow::Result<()> {
 
 impl Stream<EmptyStream> {
     #[instrument(level = "debug", skip_all)]
-    pub fn create_pipeline(self: Stream<EmptyStream>) -> Result<Stream<StreamWithPipeline>, Error> {
+    pub fn create_file_pipeline(self: Stream<EmptyStream>) -> Result<Stream<StreamWithPipeline>, Error> {
         tracing::debug!("Creating encoding pipeline");
 
         let pipeline = gst::Pipeline::default();
@@ -224,7 +224,7 @@ mod tests {
 
         let root = env!("CARGO_MANIFEST_DIR");
         let empty_stream = new_empty_stream(format!("{}/tests/file_example_MP3_700KB.mp3", root));
-        let stream_with_pipeline = empty_stream.create_pipeline()?;
+        let stream_with_pipeline = empty_stream.create_file_pipeline()?;
         let rx = stream_with_pipeline.sink_rx();
         let cancel = CancellationToken::new();
         let cancel_ = cancel.clone();

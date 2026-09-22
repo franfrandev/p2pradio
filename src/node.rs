@@ -33,7 +33,7 @@ impl Node {
         };
         let swarm = {
             let cancel = cancel.clone();
-            let topic = IdentTopic::new(cli.topic.to_string());
+            let topic = IdentTopic::new(cli.topic.as_ref().expect("TODO update impl").to_string());
             tune_in(&mut swarm, &topic)?;
             tokio::spawn(async move {
                 swarm_loop(swarm, topic, data_rx, gossip_tx, cancel).await;
@@ -42,19 +42,28 @@ impl Node {
         };
 
         let (tx, rx) = oneshot::channel();
-        let (rpc, maybe_file_rx) = {
-            let (server_type, maybe_file_ch) = match cli.command {
-                Commands::Listener(..) => (ServerType::Listener, None),
+        let (rpc, maybe_file_rx, maybe_url_rx) = {
+            let (server_type, maybe_file_ch, maybe_url_ch) = match cli.command {
+                Commands::Listener(..) => (ServerType::Listener, None, None),
                 Commands::Streamer(..) => {
                     // TODO this is not pretty
                     let (file_tx, file_rx) = mpsc::channel(1000);
-                    (ServerType::Streamer, Some((file_tx, file_rx)))
+                    let (url_tx, url_rx) = mpsc::channel(1000);
+                    (
+                        ServerType::Streamer,
+                        Some((file_tx, file_rx)),
+                        Some((url_tx, url_rx)),
+                    )
                 }
             };
             let addr = cli.http().into_socket_addr().await?;
             tracing::debug!("resolved socket addr: {}", addr);
 
             let (maybe_file_tx, maybe_file_rx) = maybe_file_ch
+                .map(|(tx, rx)| (Some(tx), Some(rx)))
+                .unwrap_or((None, None));
+
+            let (maybe_url_tx, maybe_url_rx) = maybe_url_ch
                 .map(|(tx, rx)| (Some(tx), Some(rx)))
                 .unwrap_or((None, None));
 
@@ -65,6 +74,7 @@ impl Node {
                     addr,
                     peer_id,
                     maybe_file_tx,
+                    maybe_url_tx,
                     gossip_rx,
                     cancel_,
                 )
@@ -75,14 +85,14 @@ impl Node {
                 Ok::<(), AppError>(())
             });
 
-            (rpc, maybe_file_rx)
+            (rpc, maybe_file_rx, maybe_url_rx)
         };
         let rpc_addr = rx
             .await
             .map_err(|_| AppError::Other("failed to start rpc server".to_string()))?;
 
         let backend = {
-            let backend = EncodingBackend::new(data_tx, maybe_file_rx);
+            let backend = EncodingBackend::new(data_tx, maybe_file_rx, maybe_url_rx);
 
             let cancel = cancel.clone();
             tokio::spawn(async move {
