@@ -3,16 +3,12 @@
 // gst-launch-1.0 filesrc location="/home/joe/Music/Unknown_Brother.mp3" ! mpegaudioparse ! tcpserversink host=0.0.0.0 port=8080
 // gst-launch-1.0 tcpclientsrc host=0.0.0.0 port=8080 ! mpegaudioparse ! appsink
 
-pub mod mpeg_audio_parse;
-mod mpeg_dec;
-mod uridecodebin3;
-mod vorbis_dec;
+mod icecast_ogg;
+mod ogg_dec;
 
-use crate::{
-    backend::mpeg_audio_parse::{init_gst, new_empty_stream},
-    backend::mpeg_dec::new_empty_dec_stream,
-};
+use crate::backend::ogg_dec::new_empty_dec_stream;
 use anyhow::Context;
+use gstreamer_app::gst;
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -22,6 +18,16 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
+use tracing_gstreamer as tracing_gst;
+use crate::backend::icecast_ogg::new_empty_stream;
+
+pub fn init_gst() -> anyhow::Result<()> {
+    // tracing_gst::integrate_spans();
+    tracing_gst::integrate_events();
+    // gst::log::remove_default_log_function();
+    gst::init()?;
+    Ok(())
+}
 
 pub struct EncodingBackend {
     data_tx: mpsc::Sender<Vec<u8>>,

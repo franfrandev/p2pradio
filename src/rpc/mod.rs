@@ -1,17 +1,15 @@
 use crate::backend::{DecodingBackend, OggHeaders};
 use crate::rpc::info::InfoRpcServer;
 use crate::rpc::listener::ListenerRpcServer;
-use crate::rpc::streamer::StreamerRpcServer;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use http::Request;
 use http_body_util::StreamBody;
 use http_body_util::combinators::BoxBody;
 use hyper::body::{Frame, Incoming};
 use hyper::header::CONTENT_TYPE;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper::{Response, StatusCode};
+use hyper::{Request, Response, StatusCode};
 use io::{AsyncRead, AsyncWrite};
 use jsonrpsee::core::RegisterMethodError;
 use jsonrpsee::server::{ServerBuilder, ServerHandle};
@@ -26,7 +24,7 @@ use std::{
 use thiserror::Error;
 use tokio::io::ReadBuf;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tokio::{io, select};
 use tokio_stream::wrappers::BroadcastStream;
@@ -36,7 +34,6 @@ use tracing::{instrument, log};
 
 mod info;
 mod listener;
-mod streamer;
 
 pub enum ServerType {
     Listener,
