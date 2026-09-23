@@ -2,7 +2,6 @@ use clap::{Args, Parser, Subcommand};
 use libp2p::PeerId;
 use std::fmt::Display;
 use std::io;
-use std::str::FromStr;
 use thiserror::Error;
 use tokio::net;
 

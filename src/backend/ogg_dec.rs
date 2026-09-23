@@ -4,14 +4,141 @@
 // https://gstreamer.freedesktop.org/documentation/audioparsers/mpegaudioparse.html?gi-language=c#mpegaudioparse-page
 
 use crate::backend::OggHeaders;
-use crate::backend::mpeg_dec::{DecStream, DecStreamWithPipeline, EmptyDecStream};
 use anyhow::Error;
 use byte_slice_cast::AsSliceOf;
+use futures_util::StreamExt;
 use gstreamer as gst;
+use gstreamer::bus::BusStream;
 use gstreamer::element_error;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use tokio::select;
+use tokio::sync::broadcast;
+use tokio_util::sync::CancellationToken;
 use tracing::instrument;
+use crate::backend::icecast_ogg::ErrorMessage;
+
+pub struct EmptyDecStream {
+    pub(crate) parsed_rx: flume::Receiver<Vec<u8>>,
+    pub(crate) dec_tx: broadcast::Sender<Vec<u8>>,
+}
+
+pub struct DecStreamWithPipeline {
+    pub(crate) parsed_rx: flume::Receiver<Vec<u8>>,
+    pub(crate) pipeline: gst::Pipeline,
+    pub(crate) app_src: gst_app::AppSrc,
+}
+
+pub struct DecStream<S> {
+    pub(crate) state: S,
+}
+
+pub fn new_empty_dec_stream(
+    parsed_rx: flume::Receiver<Vec<u8>>,
+    dec_tx: broadcast::Sender<Vec<u8>>,
+) -> DecStream<EmptyDecStream> {
+    DecStream {
+        state: EmptyDecStream { parsed_rx, dec_tx },
+    }
+}
+
+impl DecStream<DecStreamWithPipeline> {
+    #[instrument(level = "debug", skip_all)]
+    pub async fn run_dec_stream(
+        self: DecStream<DecStreamWithPipeline>,
+        cancel: CancellationToken,
+    ) -> Result<(), Error> {
+        tracing::debug!("Starting main loop");
+
+        tracing::debug!("Setting pipeline state to Playing");
+        self.state.pipeline.set_state(gst::State::Playing)?;
+        self.state.app_src.set_state(gst::State::Playing)?;
+
+        let bus = self
+            .state
+            .pipeline
+            .bus()
+            .expect("Pipeline without bus. Shouldn't happen!");
+
+        let mut bus_stream = bus.stream();
+
+        loop {
+            let res = self.run_loop(&mut bus_stream, &cancel).await;
+            match res {
+                Ok(true) => break,
+                Ok(false) => continue,
+                Err(err) => {
+                    tracing::error!("Error in run_loop: {:?}", err);
+                    break;
+                }
+            }
+        }
+
+        tracing::debug!("Pipeline ended");
+
+        self.state.pipeline.set_state(gst::State::Null)?;
+        self.state.app_src.set_state(gst::State::Null)?;
+
+        Ok(())
+    }
+
+    async fn run_loop(
+        &self,
+        bus_stream: &mut BusStream,
+        cancel: &CancellationToken,
+    ) -> Result<bool, Error> {
+        select! {
+            Some(msg) = bus_stream.next() => process_message(msg),
+            Ok(bytes) = self.state.parsed_rx.recv_async() => process_bytes(&self.state.app_src, bytes),
+            _ = cancel.cancelled() => {
+                tracing::warn!("Cancelled in main_loop");
+                Ok(true)
+            }
+        }
+    }
+}
+
+pub fn process_message(msg: gstreamer::Message) -> Result<bool, Error> {
+    use gst::MessageView;
+
+    tracing::debug!("Received message: {:?}", msg);
+
+    match msg.view() {
+        MessageView::Eos(..) => return Ok(true),
+        MessageView::Error(err) => {
+            tracing::error!("Received error message: {:?}", err);
+            return Err::<_, Error>(
+                ErrorMessage {
+                    src: msg
+                        .src()
+                        .map(|s| s.path_string())
+                        .unwrap_or_else(|| glib::GString::from("UNKNOWN")),
+                    error: err.error(),
+                    debug: err.debug(),
+                }
+                .into(),
+            );
+        }
+        _ => (),
+    }
+
+    Ok(false)
+}
+
+fn process_bytes(app_src: &gst_app::AppSrc, bytes: Vec<u8>) -> Result<bool, Error> {
+    tracing::debug!("Received bytes: {}", bytes.len());
+    let mut buffer = gst::Buffer::with_size(bytes.len())?;
+    buffer
+        .get_mut()
+        .ok_or(gst::FlowError::Eos)?
+        .map_writable()
+        .map_err(|_| gst::FlowError::Error)?
+        .copy_from_slice(&bytes);
+    let res = app_src.push_buffer(buffer);
+    tracing::debug!("Pushed buffer: {:?}", res);
+    res?;
+    Ok(false)
+}
 
 impl DecStream<EmptyDecStream> {
     #[instrument(level = "debug", skip_all)]
@@ -30,12 +157,14 @@ impl DecStream<EmptyDecStream> {
             // Gossip buffers carry no timestamps, stamp them on arrival.
             .is_live(true)
             .do_timestamp(true)
-            .caps(&gst::Caps::builder("application/x-rtp-stream")
-                .field("media", "audio")
-                .field("clock-rate", 48000i32)
-                .field("payload", 96i32)
-                .field("encoding-name", "OPUS")
-                .build())
+            .caps(
+                &gst::Caps::builder("application/x-rtp-stream")
+                    .field("media", "audio")
+                    .field("clock-rate", 48000i32)
+                    .field("payload", 96i32)
+                    .field("encoding-name", "OPUS")
+                    .build(),
+            )
             .build();
         let rtpstreamdepay = gst::ElementFactory::make("rtpstreamdepay")
             .name("rtpstreamdepay")
@@ -49,9 +178,7 @@ impl DecStream<EmptyDecStream> {
         let opusparse = gst::ElementFactory::make("opusparse")
             .name("opusparse")
             .build()?;
-        let oggmux = gst::ElementFactory::make("oggmux")
-            .name("oggmux")
-            .build()?;
+        let oggmux = gst::ElementFactory::make("oggmux").name("oggmux").build()?;
         // Data is paced by the network, no need to sync on the clock.
         let outsink = gst_app::AppSink::builder()
             .name("output_sink")
@@ -147,7 +274,7 @@ impl DecStream<EmptyDecStream> {
 
         Ok(DecStream::<DecStreamWithPipeline> {
             state: DecStreamWithPipeline {
-                mpeg_rx: self.state.mpeg_rx,
+                parsed_rx: self.state.parsed_rx,
                 pipeline,
                 app_src,
             },
@@ -157,11 +284,9 @@ impl DecStream<EmptyDecStream> {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::OggHeaders;
-    use crate::backend::mpeg_audio_parse::init_gst;
-    use crate::backend::mpeg_dec::new_empty_dec_stream;
+    use super::*;
+    use crate::backend::{OggHeaders, init_gst};
     use gstreamer as gst;
-    use gstreamer::prelude::*;
     use gstreamer_app as gst_app;
     use std::time::Duration;
     use tokio::sync::broadcast;
@@ -169,7 +294,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_opus_pipeline_outputs_ogg() -> Result<(), anyhow::Error> {
+    async fn test_opus_pipeline_outputs_ogg() -> Result<(), Error> {
         init_gst()?;
 
         // Same framing as the encoding side of the icecast pipeline.
