@@ -1,126 +1,94 @@
-use crate::backend::EncodingBackend;
-use crate::cli::Commands;
-use crate::p2p::swarm;
-use crate::p2p::swarm::{swarm_loop, tune_in};
-use crate::rpc::{ServerType, start_rpc_server};
-use crate::{AppError, cli};
+use crate::{
+    AppError,
+    backend::EncodingBackend,
+    cli,
+    cli::Commands,
+    p2p::swarm,
+    p2p::swarm::{swarm_listener, swarm_streamer, tune_in},
+    rpc::{RpcError, ServerVariant},
+};
 use libp2p::gossipsub::IdentTopic;
-use std::net::SocketAddr;
-use tokio::select;
-use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
+use tokio::{select, sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
-pub struct Node {
-    pub rpc_addr: SocketAddr,
-
-    swarm: JoinHandle<()>,
-    rpc: JoinHandle<Result<(), AppError>>,
-    backend: JoinHandle<()>,
-    cancel: CancellationToken,
-}
+pub struct Node;
 
 impl Node {
-    pub async fn run(cli: cli::Cli, cancel: CancellationToken) -> Result<Node, AppError> {
+    pub async fn run(cli: cli::Cli, cancel: CancellationToken) -> Result<JoinHandle<()>, AppError> {
         let mut swarm = swarm::create_swarm()?;
         let peer_id = *swarm.local_peer_id();
         let (data_tx, data_rx) = mpsc::channel(1000);
-        let (gossip_tx, gossip_rx) = if matches!(cli.command, Commands::Listener(..)) {
-            let (tx, rx) = flume::unbounded();
-            (Some(tx), Some(rx))
-        } else {
-            (None, None)
-        };
-        let swarm = {
-            let cancel = cancel.clone();
-            let topic = IdentTopic::new(cli.topic.to_string());
-            tune_in(&mut swarm, &topic)?;
-            tokio::spawn(async move {
-                swarm_loop(swarm, topic, data_rx, gossip_tx, cancel).await;
-                tracing::debug!("swarm loop stopped");
-            })
-        };
 
-        let (tx, rx) = oneshot::channel();
-        let (rpc, maybe_file_rx) = {
-            let (server_type, maybe_file_ch) = match cli.command {
-                Commands::Listener(..) => (ServerType::Listener, None),
-                Commands::Streamer(..) => {
-                    // TODO this is not pretty
-                    let (file_tx, file_rx) = mpsc::channel(1000);
-                    (ServerType::Streamer, Some((file_tx, file_rx)))
-                }
-            };
-            let addr = cli.http().into_socket_addr().await?;
-            tracing::debug!("resolved socket addr: {}", addr);
+        let rpc_addr = cli.http().into_socket_addr().await?;
 
-            let (maybe_file_tx, maybe_file_rx) = maybe_file_ch
-                .map(|(tx, rx)| (Some(tx), Some(rx)))
-                .unwrap_or((None, None));
+        let topic = cli
+            .topic
+            .ok_or(AppError::Other("missing --topic".to_string()))?;
+        let topic = IdentTopic::new(topic);
+        tune_in(&mut swarm, &topic)?;
 
-            let cancel_ = cancel.clone();
-            let rpc = tokio::spawn(async move {
-                let (addr, server_handle) = start_rpc_server(
-                    server_type,
-                    addr,
-                    peer_id,
-                    maybe_file_tx,
-                    gossip_rx,
-                    cancel_,
-                )
-                .await?;
-                tx.send(addr).expect("unreachable");
-                server_handle.stopped().await;
-                tracing::debug!("rpc server stopped");
-                Ok::<(), AppError>(())
-            });
-
-            (rpc, maybe_file_rx)
-        };
-        let rpc_addr = rx
-            .await
-            .map_err(|_| AppError::Other("failed to start rpc server".to_string()))?;
-
-        let backend = {
-            let backend = EncodingBackend::new(data_tx, maybe_file_rx);
-
-            let cancel = cancel.clone();
-            tokio::spawn(async move {
-                backend.start(cancel).await;
-            })
-        };
-
-        let node = Node {
-            swarm,
-            rpc,
-            backend,
-            rpc_addr,
-            cancel,
-        };
-
-        Ok(node)
-    }
-
-    pub async fn stopped(self) -> Result<(), AppError> {
-        select! {
-            res = self.swarm => if let Err(err) = res {
-                tracing::error!("swarm task panic: {}", err);
-            },
-            tres = self.rpc => {
-                match tres {
-                    Ok(res) => {
-                        res?;
-                        tracing::debug!("rpc task finished");
+        let handle = match cli.command {
+            Commands::Streamer(cli::Streamer { url }) => {
+                let cancel2 = cancel.clone();
+                let swarm = tokio::spawn(async move {
+                    swarm_streamer(swarm, topic, data_rx, cancel2).await;
+                    tracing::debug!("swarm streamer loop stopped");
+                });
+                let variant = ServerVariant::streamer(rpc_addr, peer_id);
+                let cancel2 = cancel.clone();
+                let server = tokio::spawn(async move {
+                    let running_server = variant.start_rpc_server(cancel2.clone()).await?;
+                    running_server.stopped(cancel2).await;
+                    Ok::<(), RpcError>(())
+                });
+                let backend = EncodingBackend::new(data_tx, url);
+                let backend = tokio::spawn(async move {
+                    backend.start(cancel).await;
+                });
+                tokio::spawn(async move {
+                    select! {
+                        _ = swarm => tracing::debug!("swarm streamer loop stopped"),
+                        _ = server => tracing::debug!("rpc server loop stopped"),
+                        _ = backend => tracing::debug!("encoding backend loop stopped"),
                     }
-                    Err(err) => tracing::error!("rpc task panic: {}", err),
-                }
-            },
-            res = self.backend => if let Err(err) = res {
-                tracing::error!("backend task panic: {}", err);
-            },
-            _ = self.cancel.cancelled() => (),
-        }
+                })
+            }
+            Commands::Listener(cli::Listener {
+                streamer_peer_id,
+                stream_addr,
+                stream_port,
+            }) => {
+                swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .add_explicit_peer(&streamer_peer_id);
+                let (gossip_tx, gossip_rx) = flume::unbounded();
+                let cancel2 = cancel.clone();
+                let swarm = tokio::spawn(async move {
+                    swarm_listener(swarm, streamer_peer_id, gossip_tx, cancel2).await;
+                    tracing::debug!("swarm listener loop stopped");
+                });
+                let stream_addr = format!("{}:{}", stream_addr, stream_port).parse().unwrap();
+                let variant = ServerVariant::listener(rpc_addr, stream_addr, peer_id, gossip_rx);
+                let cancel2 = cancel.clone();
+                let server = tokio::spawn(async move {
+                    let running_server = variant.start_rpc_server(cancel2.clone()).await?;
+                    running_server.stopped(cancel2).await;
+                    Ok::<_, RpcError>(())
+                });
+                tokio::spawn(async move {
+                    select! {
+                        _ = swarm => tracing::debug!("swarm listener loop stopped"),
+                        res = server => match res {
+                            Ok(Ok(())) => tracing::debug!("rpc server loop stopped"),
+                            Ok(Err(err)) => tracing::error!("rpc server loop stopped: {err:?}"),
+                            Err(err) => tracing::error!("rpc server loop panic: {err:?}")
+                        },
+                    }
+                })
+            }
+        };
 
-        Ok(())
+        Ok(handle)
     }
 }

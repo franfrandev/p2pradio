@@ -18,14 +18,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let cancel = CancellationToken::new();
 
-    let node = p2pradio::Node::run(cli, cancel.clone()).await?;
+    let node_handle = p2pradio::Node::run(cli, cancel.clone()).await?;
 
     select! {
         _ = ctrl_c => {
             tracing::debug!("ctrl-c received");
             cancel.cancel();
         }
-        res = node.stopped() => {
+        res = node_handle => {
             match res {
                 Ok(_) => {
                     tracing::error!("program finished");

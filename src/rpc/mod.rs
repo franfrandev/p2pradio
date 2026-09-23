@@ -1,4 +1,4 @@
-use crate::backend::DecodingBackend;
+use crate::backend::{DecodingBackend, OggHeaders};
 use crate::rpc::info::InfoRpcServer;
 use crate::rpc::listener::ListenerRpcServer;
 use crate::rpc::streamer::StreamerRpcServer;
@@ -26,11 +26,13 @@ use std::{
 use thiserror::Error;
 use tokio::io::ReadBuf;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio::{io, select};
+use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 use tokio_util::sync::CancellationToken;
-use tracing::log;
+use tracing::{instrument, log};
 
 mod info;
 mod listener;
@@ -70,38 +72,134 @@ pub mod err {
     pub const FILE_ERR: i32 = server_error(-32097);
 }
 
-pub async fn start_rpc_server(
-    server_type: ServerType,
-    address: SocketAddr,
+pub enum ServerVariant {
+    Streamer {
+        rpc_addr: SocketAddr,
+        peer_id: PeerId,
+    },
+    Listener {
+        rpc_addr: SocketAddr,
+        stream_addr: SocketAddr,
+        peer_id: PeerId,
+        gossip_rx: flume::Receiver<Vec<u8>>,
+    },
+}
+
+pub struct RunningServer {
+    pub addr: SocketAddr,
+    pub handle: ServerHandle,
+}
+
+impl ServerVariant {
+    pub fn streamer(rpc_addr: SocketAddr, peer_id: PeerId) -> ServerVariant {
+        ServerVariant::Streamer { rpc_addr, peer_id }
+    }
+
+    pub fn listener(
+        rpc_addr: SocketAddr,
+        stream_addr: SocketAddr,
+        peer_id: PeerId,
+        gossip_rx: flume::Receiver<Vec<u8>>,
+    ) -> ServerVariant {
+        ServerVariant::Listener {
+            rpc_addr,
+            stream_addr,
+            peer_id,
+            gossip_rx,
+        }
+    }
+
+    pub async fn start_rpc_server(
+        self,
+        cancel: CancellationToken,
+    ) -> Result<RunningServer, RpcError> {
+        let (addr, handle) = match self {
+            ServerVariant::Streamer { rpc_addr, peer_id } => {
+                start_streamer_server(rpc_addr, peer_id).await?
+            }
+            ServerVariant::Listener {
+                rpc_addr,
+                stream_addr: listener_addr,
+                peer_id,
+                gossip_rx,
+            } => {
+                let (addr, h1, h2, handle) =
+                    start_listener_server(rpc_addr, listener_addr, peer_id, gossip_rx, cancel)
+                        .await?;
+                tokio::spawn(async move {
+                    select! {
+                        _ = h1 => {},
+                        _ = h2 => {},
+                    }
+                });
+                (addr, handle)
+            }
+        };
+
+        Ok(RunningServer { addr, handle })
+    }
+}
+
+impl RunningServer {
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    pub async fn stopped(self, cancel: CancellationToken) {
+        select! {
+            _ = self.handle.stopped() => {}
+            _ = cancel.cancelled() => {}
+        }
+    }
+}
+
+pub(crate) async fn start_streamer_server(
+    rpc_addr: SocketAddr,
     peer_id: PeerId,
-    file_tx: Option<mpsc::Sender<(String, oneshot::Sender<Result<(), String>>)>>,
-    gossip_rx: Option<flume::Receiver<Vec<u8>>>,
-    cancel: CancellationToken,
 ) -> Result<(SocketAddr, ServerHandle), RpcError> {
-    let server = ServerBuilder::default().build(address).await?;
+    let server = ServerBuilder::default().build(rpc_addr).await?;
     let addr = server.local_addr()?;
 
-    let mut methods = info::InfoRpcImpl { peer_id }.into_rpc();
-
-    match server_type {
-        ServerType::Listener => {
-            let gossip_rx = gossip_rx.expect("should be defined for listener");
-            let (_handle, _backend, local_addr) = start_server(gossip_rx, cancel).await?;
-            methods.merge(listener::ListenerRpcImpl { local_addr }.into_rpc())?
-        }
-        ServerType::Streamer => methods.merge(
-            streamer::StreamerRpcImpl {
-                file_tx: file_tx.expect("file_tx must be provided for streamer server"),
-            }
-            .into_rpc(),
-        )?,
-    };
+    let methods = info::InfoRpcImpl { peer_id }.into_rpc();
 
     let server_handle = server.start(methods);
 
     tracing::info!("RPC server started at {}", addr);
 
     Ok((addr, server_handle))
+}
+
+#[instrument(skip(peer_id, gossip_rx, cancel))]
+async fn start_listener_server(
+    rpc_addr: SocketAddr,
+    listener_addr: SocketAddr,
+    peer_id: PeerId,
+    gossip_rx: flume::Receiver<Vec<u8>>,
+    cancel: CancellationToken,
+) -> Result<
+    (
+        SocketAddr,
+        JoinHandle<Result<(), RpcError>>,
+        JoinHandle<Result<(), anyhow::Error>>,
+        ServerHandle,
+    ),
+    RpcError,
+> {
+    tracing::debug!("Starting JSON rpc server");
+    let server = ServerBuilder::default().build(rpc_addr).await?;
+    let addr = server.local_addr()?;
+
+    let mut methods = info::InfoRpcImpl { peer_id }.into_rpc();
+
+    let (server_listener_handle, backend, local_addr) =
+        start_server(listener_addr, gossip_rx, cancel).await?;
+    methods.merge(listener::ListenerRpcImpl { local_addr }.into_rpc())?;
+
+    let server_handle = server.start(methods);
+
+    tracing::info!("RPC server started at {}", addr);
+
+    Ok((addr, server_listener_handle, backend, server_handle))
 }
 
 pin_project! {
@@ -244,7 +342,9 @@ where
     }
 }
 
+#[instrument(skip(gossip_rx, cancel))]
 async fn start_server(
+    listener_addr: SocketAddr,
     gossip_rx: flume::Receiver<Vec<u8>>,
     cancel: CancellationToken,
 ) -> Result<
@@ -255,46 +355,50 @@ async fn start_server(
     ),
     RpcError,
 > {
-    let addr = SocketAddr::from(([127, 0, 0, 1], 0));
-
-    let listener = TcpListener::bind(addr).await?;
+    tracing::debug!("Starting rpc server");
+    let listener = TcpListener::bind(listener_addr).await?;
     let local_addr = listener.local_addr()?;
     tracing::info!("Listening on {}", local_addr);
 
-    let (stream_tx, stream_rx) = flume::unbounded();
+    let (dec_tx, _) = broadcast::channel(100);
+    let headers = OggHeaders::default();
 
     let cancel_ = cancel.clone();
+    let dec_tx2 = dec_tx.clone();
+    let headers2 = headers.clone();
     let backend = tokio::spawn(async move {
         tracing::debug!("Starting decoding backend");
-        let back = DecodingBackend::new(gossip_rx, stream_tx);
+        let back = DecodingBackend::new(gossip_rx, dec_tx2, headers2);
         let res = back.run(cancel_).await;
         tracing::error!("Backend finished with result: {:?}", res);
         res
     });
 
-    let handle =
-        tokio::spawn(async move { server_listener(listener, stream_rx.clone(), cancel).await });
+    let server_listener_handle =
+        tokio::spawn(async move { server_listener(listener, dec_tx, headers, cancel).await });
 
-    Ok((handle, backend, local_addr))
+    Ok((server_listener_handle, backend, local_addr))
 }
 
 async fn server_listener(
     listener: TcpListener,
-    stream_rx: flume::Receiver<Vec<u8>>,
+    dec_tx: broadcast::Sender<Vec<u8>>,
+    headers: OggHeaders,
     cancel: CancellationToken,
 ) -> Result<(), RpcError> {
     loop {
         select! {
             Ok((stream, _)) = listener.accept() => {
                 log::debug!("Accepted connection: {:?}", stream.peer_addr());
-                let stream_rx = stream_rx.clone();
+                let dec_tx = dec_tx.clone();
+                let headers = headers.clone();
                 tokio::spawn(async move {
                     let io = TokioIo::new(stream);
 
                     if let Err(err) = http1::Builder::new()
                         .serve_connection(
                             io,
-                            service_fn(|req| async { response_stream(req, stream_rx.clone()).await }),
+                            service_fn(|req| async { response_stream(req, &dec_tx, &headers).await }),
                         )
                         .await
                     {
@@ -311,22 +415,39 @@ async fn server_listener(
 
 pub async fn response_stream(
     req: Request<Incoming>,
-    stream_rx: flume::Receiver<Vec<u8>>,
+    dec_tx: &broadcast::Sender<Vec<u8>>,
+    headers: &OggHeaders,
 ) -> hyper::Result<Response<BoxBody<Bytes, Infallible>>> {
     tracing::debug!("Received request: {:?}", req);
-    let stream = stream_rx.into_stream();
-    let stream = stream.map(|item| {
-        tracing::trace!("Received item: {:?}", item.len());
-        let b = Bytes::from(item);
-        let f = Frame::data(b);
-        Ok(f)
+    // Snapshot the headers and subscribe under the same lock, so that header pages
+    // are neither missed nor duplicated if the decoder is emitting them right now.
+    let (headers, rx) = {
+        let headers = headers.lock().expect("headers lock poisoned");
+        (headers.clone(), dec_tx.subscribe())
+    };
+    let live = BroadcastStream::new(rx).filter_map(|item| async move {
+        match item {
+            Ok(item) => {
+                tracing::trace!("Received item: {:?}", item.len());
+                Some(item)
+            }
+            // A slow client skips pages rather than being disconnected.
+            Err(BroadcastStreamRecvError::Lagged(n)) => {
+                tracing::warn!("HTTP client lagged, skipped {} pages", n);
+                None
+            }
+        }
     });
+    let stream = futures_util::stream::iter(headers)
+        .chain(live)
+        .map(|item| Ok(Frame::data(Bytes::from(item))));
     let stream = StreamBody::new(stream);
     let body = BoxBody::new(stream);
 
+    // TODO keep track of icecast headers
     let res = Response::builder()
         .status(StatusCode::OK)
-        .header(CONTENT_TYPE, "audio/mpeg")
+        .header(CONTENT_TYPE, "audio/ogg")
         .body(body)
         .expect("Failed to build Response");
 

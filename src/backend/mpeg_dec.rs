@@ -13,27 +13,28 @@ use gstreamer::element_error;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use tokio::select;
+use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 pub struct EmptyDecStream {
-    mpeg_rx: flume::Receiver<Vec<u8>>,
-    dec_tx: flume::Sender<Vec<u8>>,
+    pub(crate) mpeg_rx: flume::Receiver<Vec<u8>>,
+    pub(crate) dec_tx: broadcast::Sender<Vec<u8>>,
 }
 
 pub struct DecStreamWithPipeline {
-    mpeg_rx: flume::Receiver<Vec<u8>>,
-    pipeline: gst::Pipeline,
-    app_src: gst_app::AppSrc,
+    pub(crate) mpeg_rx: flume::Receiver<Vec<u8>>,
+    pub(crate) pipeline: gst::Pipeline,
+    pub(crate) app_src: gst_app::AppSrc,
 }
 
 pub struct DecStream<S> {
-    state: S,
+    pub(crate) state: S,
 }
 
 pub fn new_empty_dec_stream(
     mpeg_rx: flume::Receiver<Vec<u8>>,
-    dec_tx: flume::Sender<Vec<u8>>,
+    dec_tx: broadcast::Sender<Vec<u8>>,
 ) -> DecStream<EmptyDecStream> {
     DecStream {
         state: EmptyDecStream { mpeg_rx, dec_tx },
@@ -249,10 +250,11 @@ mod tests {
         init_gst()?;
 
         let root = env!("CARGO_MANIFEST_DIR");
-        let empty_stream = crate::backend::mpeg_audio_parse::new_empty_stream(
-            format!("{}/tests/file_example_MP3_700KB.mp3", root),
-        );
-        let stream_with_pipeline = empty_stream.create_pipeline()?;
+        let empty_stream = crate::backend::mpeg_audio_parse::new_empty_stream(format!(
+            "{}/tests/file_example_MP3_700KB.mp3",
+            root
+        ));
+        let stream_with_pipeline = empty_stream.create_file_pipeline()?;
         let mpeg_rx = stream_with_pipeline.sink_rx();
         let cancel = CancellationToken::new();
         let cancel_ = cancel.clone();
@@ -262,7 +264,7 @@ mod tests {
             }
         });
 
-        let (dec_tx, dec_rx) = flume::unbounded();
+        let (dec_tx, mut dec_rx) = broadcast::channel(10);
         let empty_dec_stream = new_empty_dec_stream(mpeg_rx, dec_tx);
         let dec_stream_with_pipeline = empty_dec_stream
             .create_pipeline()
@@ -281,7 +283,7 @@ mod tests {
         });
 
         tracing::debug!("WAITING FOR TIMEOUT");
-        let res = timeout(Duration::from_secs(4), dec_rx.recv_async()).await;
+        let res = timeout(Duration::from_secs(4), dec_rx.recv()).await;
         cancel.cancel();
         let Ok(Ok(recv)) = res else {
             tracing::error!("failed, reason: {:?}", res);

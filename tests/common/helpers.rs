@@ -24,7 +24,7 @@ fn build_cli(command: Commands, topic: String) -> Result<Cli, anyhow::Error> {
         command,
         http_addr: "127.0.0.1".to_string(),
         http_port: 0,
-        topic,
+        topic: Some(topic),
     };
 
     Ok(cli)

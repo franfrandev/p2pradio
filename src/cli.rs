@@ -12,16 +12,15 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
 
-    // #[arg(long, global = true, default_value_t = Http::default(), value_parser = clap::value_parser!(Http))]
-    // pub(crate) http: Http,
-    #[arg(long = "http.addr", global = true, default_value = "127.0.0.1")]
+    #[arg(long = "http.addr", global = true, default_value = "0.0.0.0")]
     pub http_addr: String,
 
     #[arg(long = "http.port", global = true, default_value = "7890")]
     pub http_port: u16,
 
+    // this is a limitation of clap: https://github.com/clap-rs/clap/issues/1546
     #[arg(short, long, global = true)]
-    pub topic: String,
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -36,10 +35,19 @@ pub enum Commands {
 pub struct Listener {
     #[arg(short, long)]
     pub streamer_peer_id: PeerId,
+
+    #[arg(long = "stream.addr", default_value = "0.0.0.0")]
+    pub stream_addr: String,
+
+    #[arg(long = "stream.port", default_value = "10909")]
+    pub stream_port: u16,
 }
 
 #[derive(Debug, Args)]
-pub struct Streamer {}
+pub struct Streamer {
+    #[arg(long, default_value = "http://localhost:8000/main")]
+    pub url: String,
+}
 
 impl Cli {
     pub fn http(&self) -> Http {
@@ -54,28 +62,6 @@ impl Cli {
 pub struct Http {
     addr: String,
     port: u16,
-}
-
-impl Default for Http {
-    fn default() -> Self {
-        Self {
-            addr: "127.0.0.1".to_string(),
-            port: 8080,
-        }
-    }
-}
-
-impl FromStr for Http {
-    type Err = String;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let (addr, port) = s.rsplit_once(':').ok_or("Invalid address format")?;
-        let port = port.parse().map_err(|_| "Invalid port number")?;
-        Ok(Self {
-            addr: addr.to_string(),
-            port,
-        })
-    }
 }
 
 #[derive(Debug, Error)]
