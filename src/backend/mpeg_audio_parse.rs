@@ -3,7 +3,7 @@
 // The pipeline also has an app sink which allows then sampling these frames to write them into a buffer.
 // https://gstreamer.freedesktop.org/documentation/audioparsers/mpegaudioparse.html?gi-language=c#mpegaudioparse-page
 
-use anyhow::{Error};
+use anyhow::Error;
 use byte_slice_cast::AsSliceOf;
 use derive_more::{Display, Error};
 use gstreamer as gst;
@@ -16,9 +16,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use tracing_gstreamer as tracing_gst;
 
-pub struct EmptyStream {
-    pub(crate) file: String,
-}
+pub struct EmptyStream {}
 
 pub struct StreamWithPipeline {
     pub(crate) pipeline: gst::Pipeline,
@@ -37,9 +35,9 @@ pub struct ErrorMessage {
     pub debug: Option<glib::GString>,
 }
 
-pub fn new_empty_stream(file: String) -> Stream<EmptyStream> {
+pub fn new_empty_stream() -> Stream<EmptyStream> {
     Stream {
-        state: EmptyStream { file },
+        state: EmptyStream {},
     }
 }
 
@@ -53,14 +51,17 @@ pub fn init_gst() -> anyhow::Result<()> {
 
 impl Stream<EmptyStream> {
     #[instrument(level = "debug", skip_all)]
-    pub fn create_file_pipeline(self: Stream<EmptyStream>) -> Result<Stream<StreamWithPipeline>, Error> {
+    pub fn create_file_pipeline(
+        self: Stream<EmptyStream>,
+        file: String,
+    ) -> Result<Stream<StreamWithPipeline>, Error> {
         tracing::debug!("Creating encoding pipeline");
 
         let pipeline = gst::Pipeline::default();
 
         let filesrc = gst::ElementFactory::make("filesrc")
             .name("filesrc")
-            .property("location", self.state.file)
+            .property("location", file)
             .build()?;
         let parser = gst::ElementFactory::make("mpegaudioparse")
             .name("parser")
@@ -223,8 +224,9 @@ mod tests {
         init_gst()?;
 
         let root = env!("CARGO_MANIFEST_DIR");
-        let empty_stream = new_empty_stream(format!("{}/tests/file_example_MP3_700KB.mp3", root));
-        let stream_with_pipeline = empty_stream.create_file_pipeline()?;
+        let empty_stream = new_empty_stream();
+        let stream_with_pipeline = empty_stream
+            .create_file_pipeline(format!("{}/tests/file_example_MP3_700KB.mp3", root))?;
         let rx = stream_with_pipeline.sink_rx();
         let cancel = CancellationToken::new();
         let cancel_ = cancel.clone();

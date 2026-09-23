@@ -18,9 +18,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 use tracing_gstreamer as tracing_gst;
 
-pub fn new_empty_stream(file: String) -> Stream<EmptyStream> {
+pub fn new_empty_stream() -> Stream<EmptyStream> {
     Stream {
-        state: EmptyStream { file },
+        state: EmptyStream {},
     }
 }
 
@@ -40,6 +40,7 @@ impl Stream<EmptyStream> {
     #[instrument(level = "debug", skip_all)]
     pub fn create_icecast_pipeline(
         self: Stream<EmptyStream>,
+        url: String,
     ) -> Result<Stream<StreamWithPipeline>, Error> {
         tracing::debug!("Creating encoding pipeline");
 
@@ -47,7 +48,7 @@ impl Stream<EmptyStream> {
 
         let souphttpsrc = gst::ElementFactory::make("souphttpsrc")
             .name("souphttpsrc")
-            .property("location", "http://localhost:8000/main")
+            .property("location", url)
             .property("iradio-mode", true)
             .build()?;
         let decodebin = gst::ElementFactory::make("decodebin")
