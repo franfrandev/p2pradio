@@ -3,8 +3,10 @@ use crate::p2p::codec::Message;
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub::{IdentTopic, MessageId};
 use libp2p::kad::store::MemoryStore;
+use libp2p::metrics::{Metrics, Registry};
 use libp2p::swarm::{NetworkBehaviour, SwarmEvent};
 use libp2p::{PeerId, Swarm, SwarmBuilder, gossipsub, identify, kad, mdns, ping};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::io;
 use tokio::sync::mpsc;
@@ -29,10 +31,13 @@ pub enum GossipError {
     AlreadySubscribed,
 }
 
-pub(crate) fn create_swarm() -> Result<Swarm<RadioBehavior>, AppError> {
+pub(crate) fn create_swarm(
+    metric_registry: &mut Registry,
+) -> Result<Swarm<RadioBehavior>, AppError> {
     let mut swarm = SwarmBuilder::with_new_identity()
         .with_tokio()
         .with_quic()
+        .with_bandwidth_metrics(metric_registry)
         .with_behaviour(|key| {
             let local_public_key = key.public();
             let local_id = local_public_key.to_peer_id();
