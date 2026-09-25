@@ -6,7 +6,9 @@
 mod icecast_ogg;
 mod ogg_dec;
 
+use crate::backend::icecast_ogg::new_empty_stream;
 use crate::backend::ogg_dec::new_empty_dec_stream;
+use crate::p2p::codec::{Message, Metadata};
 use anyhow::Context;
 use gstreamer_app::gst;
 use std::{
@@ -14,12 +16,12 @@ use std::{
     time::Duration,
 };
 use tokio::{
+    select,
     sync::{broadcast, mpsc},
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
 use tracing_gstreamer as tracing_gst;
-use crate::backend::icecast_ogg::new_empty_stream;
 
 pub fn init_gst() -> anyhow::Result<()> {
     // tracing_gst::integrate_spans();
@@ -30,19 +32,19 @@ pub fn init_gst() -> anyhow::Result<()> {
 }
 
 pub struct EncodingBackend {
-    data_tx: mpsc::Sender<Vec<u8>>,
+    gossip_tx: mpsc::Sender<Message>,
     url: String,
 }
 
 impl EncodingBackend {
-    pub fn new(data_tx: mpsc::Sender<Vec<u8>>, url: String) -> Self {
-        Self { data_tx, url }
+    pub fn new(gossip_tx: mpsc::Sender<Message>, url: String) -> Self {
+        Self { gossip_tx, url }
     }
 
     pub async fn start(self, cancel: CancellationToken) {
         init_gst().expect("Failed to initialize GStreamer");
         loop {
-            tokio::select! {
+            select! {
                 Err(err) = self.process_url(cancel.clone()) => {
                     tracing::error!("Error processing url: {}", err)
                 }
@@ -62,21 +64,33 @@ impl EncodingBackend {
         let stream_with_pipeline = empty_stream
             .create_icecast_pipeline(url)
             .map_err(|e| e.to_string())?;
-        tracing::debug!("Encoding pipeline created OK");
-        let rx = stream_with_pipeline.sink_rx();
-        tracing::debug!("Will start encoding main loop");
+
+        let sink_rx = stream_with_pipeline.sink_rx();
+        let mut title_rx = stream_with_pipeline.title_rx();
+
         tokio::spawn(async move {
-            tracing::debug!("Now start encoding main loop");
+            tracing::debug!("Starting encoding main loop");
             if let Err(err) = stream_with_pipeline.main_loop(cancel).await {
                 tracing::error!("Error in main loop: {}", err);
             }
         });
-        while let Ok(buf) = rx.recv_async().await {
-            tracing::trace!("Received buffer of size {}", buf.len());
-            self.data_tx.send(buf).await.map_err(|e| e.to_string())?;
-        }
 
-        Ok(())
+        loop {
+            select! {
+                Ok(buf) = sink_rx.recv_async() => {
+                    tracing::trace!("Received buffer of size {}", buf.len());
+                    let msg = Message::AudioPacket(buf);
+                    self.gossip_tx.send(msg).await.map_err(|e| e.to_string())?;
+                }
+                Ok(()) = title_rx.changed() => {
+                    let value = title_rx.borrow_and_update().clone();
+                    if let Some(title) = value {
+                        let msg = Message::Metadata(Metadata { title });
+                        self.gossip_tx.send(msg).await.map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+        }
     }
 }
 

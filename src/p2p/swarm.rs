@@ -1,4 +1,5 @@
 use crate::AppError;
+use crate::p2p::codec::Message;
 use libp2p::futures::StreamExt;
 use libp2p::gossipsub::{IdentTopic, MessageId};
 use libp2p::kad::store::MemoryStore;
@@ -87,16 +88,13 @@ fn message_id(msg: &gossipsub::Message) -> MessageId {
 pub async fn swarm_streamer(
     mut swarm: Swarm<RadioBehavior>,
     topic: IdentTopic,
-    mut data_rx: mpsc::Receiver<Vec<u8>>,
+    mut gossip_rx: mpsc::Receiver<Message>,
     cancel: CancellationToken,
 ) {
     loop {
         tokio::select! {
-            data = data_rx.recv() => {
-                let Some(data) = data else {
-                    tracing::debug!("data stream closed");
-                    continue
-                };
+            Some(msg) = gossip_rx.recv() => {
+                let data = msg.encode();
                 tracing::trace!("received data to publish: {} bytes", data.len());
                 if let Err(err) = publish_data(&mut swarm, topic.clone(), data) {
                     tracing::debug!("Failed to publish data: {err}");
@@ -111,7 +109,7 @@ pub async fn swarm_streamer(
 pub async fn swarm_listener(
     mut swarm: Swarm<RadioBehavior>,
     streamer_peer_id: PeerId,
-    gossip_tx: flume::Sender<Vec<u8>>,
+    gossip_tx: flume::Sender<Message>,
     cancel: CancellationToken,
 ) {
     loop {
@@ -169,7 +167,7 @@ async fn process_listener_event(
     swarm: &mut Swarm<RadioBehavior>,
     streamer_peer_id: PeerId,
     event: SwarmEvent<RadioBehaviorEvent>,
-    gossip_tx: &flume::Sender<Vec<u8>>,
+    gossip_tx: &flume::Sender<Message>,
 ) {
     tracing::trace!("Swarm Event: {:?}", event);
     match event {
@@ -186,7 +184,7 @@ async fn process_listener_behavior_event(
     swarm: &mut Swarm<RadioBehavior>,
     streamer_peer_id: PeerId,
     b_event: RadioBehaviorEvent,
-    gossip_tx: &flume::Sender<Vec<u8>>,
+    gossip_tx: &flume::Sender<Message>,
 ) {
     match b_event {
         RadioBehaviorEvent::Mdns(mdns_event) => process_mdns_event(swarm, mdns_event),
@@ -223,7 +221,7 @@ pub async fn process_gossip_sub_event(
     swarm: &mut Swarm<RadioBehavior>,
     gossip_sub_event: gossipsub::Event,
     streamer_peer_id: PeerId,
-    gossip_tx: &flume::Sender<Vec<u8>>,
+    gossip_tx: &flume::Sender<Message>,
 ) {
     match gossip_sub_event {
         gossipsub::Event::Message {
@@ -246,7 +244,11 @@ pub async fn process_gossip_sub_event(
             };
             // TODO reorder messages based on seq_no while buffering according to max wait in case of drops
             tracing::debug!("message seq no: {seq_no}");
-            if let Err(err) = gossip_tx.send_async(message.data).await {
+            let Ok(msg) = Message::decode(message.data) else {
+                tracing::warn!("failed to decode message");
+                return;
+            };
+            if let Err(err) = gossip_tx.send_async(msg).await {
                 tracing::warn!("failed to send gossip message: {err}");
             }
         }

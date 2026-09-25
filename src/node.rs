@@ -17,7 +17,6 @@ impl Node {
     pub async fn run(cli: cli::Cli, cancel: CancellationToken) -> Result<JoinHandle<()>, AppError> {
         let mut swarm = swarm::create_swarm()?;
         let peer_id = *swarm.local_peer_id();
-        let (data_tx, data_rx) = mpsc::channel(1000);
 
         let rpc_addr = cli.http().into_socket_addr().await?;
 
@@ -29,9 +28,10 @@ impl Node {
 
         let handle = match cli.command {
             Commands::Streamer(cli::Streamer { url }) => {
+                let (gossip_tx, gossip_rx) = mpsc::channel(1000);
                 let cancel2 = cancel.clone();
                 let swarm = tokio::spawn(async move {
-                    swarm_streamer(swarm, topic, data_rx, cancel2).await;
+                    swarm_streamer(swarm, topic, gossip_rx, cancel2).await;
                     tracing::debug!("swarm streamer loop stopped");
                 });
                 let variant = ServerVariant::streamer(rpc_addr, peer_id);
@@ -41,7 +41,7 @@ impl Node {
                     running_server.stopped(cancel2).await;
                     Ok::<(), RpcError>(())
                 });
-                let backend = EncodingBackend::new(data_tx, url);
+                let backend = EncodingBackend::new(gossip_tx, url);
                 let backend = tokio::spawn(async move {
                     backend.start(cancel).await;
                 });

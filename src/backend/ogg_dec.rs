@@ -1,9 +1,7 @@
-// This module provides functionality for parsing audio data using the mpegaudioparse element from GStreamer.
-// It provides seeking for MPEG files frames, as we cannot naively just cut frames in between because of the bit sink.
-// The pipeline also has an app sink which allows then sampling these frames to write them into a buffer.
-// https://gstreamer.freedesktop.org/documentation/audioparsers/mpegaudioparse.html?gi-language=c#mpegaudioparse-page
+// Reconstruct an Ogg/Opus stream from individual RTP packets for HTTP listeners.
 
 use crate::backend::OggHeaders;
+use crate::backend::icecast_ogg::ErrorMessage;
 use anyhow::Error;
 use byte_slice_cast::AsSliceOf;
 use futures_util::StreamExt;
@@ -16,7 +14,6 @@ use tokio::select;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
-use crate::backend::icecast_ogg::ErrorMessage;
 
 pub struct EmptyDecStream {
     pub(crate) parsed_rx: flume::Receiver<Vec<u8>>,
@@ -27,6 +24,7 @@ pub struct DecStreamWithPipeline {
     pub(crate) parsed_rx: flume::Receiver<Vec<u8>>,
     pub(crate) pipeline: gst::Pipeline,
     pub(crate) app_src: gst_app::AppSrc,
+    pub(crate) dec_tx: broadcast::Sender<Vec<u8>>,
 }
 
 pub struct DecStream<S> {
@@ -52,13 +50,17 @@ impl DecStream<DecStreamWithPipeline> {
 
         tracing::debug!("Setting pipeline state to Playing");
         self.state.pipeline.set_state(gst::State::Playing)?;
-        self.state.app_src.set_state(gst::State::Playing)?;
 
         let bus = self
             .state
             .pipeline
             .bus()
             .expect("Pipeline without bus. Shouldn't happen!");
+
+        bus.add_signal_watch();
+        bus.connect_message(None, |_, msg| {
+            tracing::warn!("Received message: {:?}", msg);
+        });
 
         let mut bus_stream = bus.stream();
 
@@ -77,7 +79,6 @@ impl DecStream<DecStreamWithPipeline> {
         tracing::debug!("Pipeline ended");
 
         self.state.pipeline.set_state(gst::State::Null)?;
-        self.state.app_src.set_state(gst::State::Null)?;
 
         Ok(())
     }
@@ -154,11 +155,10 @@ impl DecStream<EmptyDecStream> {
         let app_src = gst_app::AppSrc::builder()
             .name("app_src")
             .format(gst::Format::Time)
-            // Gossip buffers carry no timestamps, stamp them on arrival.
             .is_live(true)
             .do_timestamp(true)
             .caps(
-                &gst::Caps::builder("application/x-rtp-stream")
+                &gst::Caps::builder("application/x-rtp")
                     .field("media", "audio")
                     .field("clock-rate", 48000i32)
                     .field("payload", 96i32)
@@ -166,20 +166,21 @@ impl DecStream<EmptyDecStream> {
                     .build(),
             )
             .build();
-        let rtpstreamdepay = gst::ElementFactory::make("rtpstreamdepay")
-            .name("rtpstreamdepay")
+
+        // Recover ordering and timestamps after transport drops GstBuffer metadata.
+        let rtpjitterbuffer = gst::ElementFactory::make("rtpjitterbuffer")
+            .name("rtpjitterbuffer")
             .build()?;
+
         let rtpopusdepay = gst::ElementFactory::make("rtpopusdepay")
             .name("rtpopusdepay")
             .build()?;
-        // Opus packets are remuxed into Ogg rather than decoded, so that the HTTP body is
-        // a self-describing `audio/ogg` stream. opusparse synthesizes the OpusHead/OpusTags
-        // headers that are not carried over RTP.
-        let opusparse = gst::ElementFactory::make("opusparse")
-            .name("opusparse")
+        // Keep the audio compressed; HTTP clients need Ogg pages, not PCM samples.
+        let opusparse = gst::ElementFactory::make("opusparse").build()?;
+        let oggmux = gst::ElementFactory::make("oggmux")
+            .property("max-delay", 100_000_000u64)
+            .property("max-page-delay", 100_000_000u64)
             .build()?;
-        let oggmux = gst::ElementFactory::make("oggmux").name("oggmux").build()?;
-        // Data is paced by the network, no need to sync on the clock.
         let outsink = gst_app::AppSink::builder()
             .name("output_sink")
             .sync(false)
@@ -187,7 +188,7 @@ impl DecStream<EmptyDecStream> {
 
         let elements = &[
             app_src.upcast_ref(),
-            &rtpstreamdepay,
+            &rtpjitterbuffer,
             &rtpopusdepay,
             &opusparse,
             &oggmux,
@@ -237,27 +238,23 @@ impl DecStream<EmptyDecStream> {
                     tracing::trace!("samples: {:?}", samples);
                     tracing::debug!("samples: {}", samples.len());
 
-                    // Ogg header pages are only emitted once at the start of a chain, so they
-                    // are cached for late HTTP clients. The lock is held while broadcasting so
-                    // a subscribing client sees each header page exactly once.
+                    // Share the lock with HTTP subscription so a joining listener
+                    // receives each header exactly once, before any audio pages.
+                    let mut cached_headers = headers.lock().expect("headers lock poisoned");
                     let is_header = buffer.flags().contains(gst::BufferFlags::HEADER);
-                    let _guard = if is_header {
-                        let mut guard = headers.lock().expect("headers lock poisoned");
+                    if is_header {
                         if !last_was_header {
-                            // A new Ogg chain starts, the previous headers are stale.
-                            guard.clear();
+                            cached_headers.clear();
                         }
-                        guard.push(samples.to_vec());
-                        Some(guard)
-                    } else {
-                        None
-                    };
+                        cached_headers.push(samples.to_vec());
+                    }
                     last_was_header = is_header;
 
-                    if dec_tx.send(samples.to_vec()).is_err() {
-                        tracing::error!(
-                            "Failed to send samples, expect loss. samples: {}",
-                            samples.len()
+                    if let Err(err) = dec_tx.send(samples.to_vec()) {
+                        tracing::debug!(
+                            "Failed to send samples, expect loss. samples: {}, err: {}",
+                            samples.len(),
+                            err
                         );
                     }
 
@@ -268,8 +265,7 @@ impl DecStream<EmptyDecStream> {
 
         tracing::debug!("Pipeline linked");
 
-        app_src.set_state(gst::State::Ready)?;
-        outsink.set_state(gst::State::Ready)?;
+        pipeline.set_state(gst::State::Ready)?;
         tracing::debug!("Pipeline created");
 
         Ok(DecStream::<DecStreamWithPipeline> {
@@ -277,6 +273,7 @@ impl DecStream<EmptyDecStream> {
                 parsed_rx: self.state.parsed_rx,
                 pipeline,
                 app_src,
+                dec_tx: self.state.dec_tx,
             },
         })
     }
@@ -300,7 +297,7 @@ mod tests {
         // Same framing as the encoding side of the icecast pipeline.
         let enc = gst::parse::launch(
             "audiotestsrc num-buffers=100 ! audioconvert ! audioresample ! opusenc \
-             ! rtpopuspay ! rtpstreampay ! appsink name=sink",
+             ! rtpopuspay pt=96 ! appsink name=sink",
         )?
         .downcast::<gst::Pipeline>()
         .expect("not a pipeline");
@@ -324,29 +321,73 @@ mod tests {
 
         let (dec_tx, mut dec_rx) = broadcast::channel(1000);
         let headers = OggHeaders::default();
-        let dec = new_empty_dec_stream(gossip_rx, dec_tx)
+        let dec = new_empty_dec_stream(gossip_rx, dec_tx.clone())
             .create_opus_pipeline(headers.clone())
             .await?;
 
         let cancel = CancellationToken::new();
         let cancel_ = cancel.clone();
-        tokio::spawn(async move { dec.run_dec_stream(cancel_).await });
+        let decoder = tokio::spawn(async move { dec.run_dec_stream(cancel_).await });
         enc.set_state(gst::State::Playing)?;
 
         let first = timeout(Duration::from_secs(5), dec_rx.recv()).await??;
-        // Wait for some audio pages past the headers.
+        let mut initial_stream = first.clone();
+        // Wait until both headers and audio have been published.
         for _ in 0..3 {
-            timeout(Duration::from_secs(5), dec_rx.recv()).await??;
+            initial_stream.extend(timeout(Duration::from_secs(5), dec_rx.recv()).await??);
+        }
+        // Mirror HTTP: prepend cached headers, then receive live pages.
+        let (mut late_stream, mut late_rx) = {
+            let headers = headers.lock().unwrap();
+            (headers.concat(), dec_tx.subscribe())
+        };
+        for _ in 0..3 {
+            late_stream.extend(timeout(Duration::from_secs(5), late_rx.recv()).await??);
         }
         cancel.cancel();
         enc.set_state(gst::State::Null)?;
+        timeout(Duration::from_secs(5), decoder).await???;
 
         assert!(first.starts_with(b"OggS"));
         let headers = headers.lock().unwrap();
         assert_eq!(headers.len(), 2);
         assert!(headers[0].windows(8).any(|w| w == b"OpusHead"));
         assert!(headers[1].windows(8).any(|w| w == b"OpusTags"));
+        drop(headers);
 
+        assert_ogg_decodes(initial_stream)?;
+        assert_ogg_decodes(late_stream)?;
+
+        Ok(())
+    }
+
+    fn assert_ogg_decodes(bytes: Vec<u8>) -> Result<(), Error> {
+        let playback = gst::parse::launch(
+            "appsrc name=source ! oggdemux ! opusdec ! appsink name=audio sync=false",
+        )?
+        .downcast::<gst::Pipeline>()
+        .expect("not a pipeline");
+        let source = playback
+            .by_name("source")
+            .unwrap()
+            .downcast::<gst_app::AppSrc>()
+            .unwrap();
+        let audio = playback
+            .by_name("audio")
+            .unwrap()
+            .downcast::<gst_app::AppSink>()
+            .unwrap();
+        playback.set_state(gst::State::Playing)?;
+        source.push_buffer(gst::Buffer::from_mut_slice(bytes))?;
+        source.end_of_stream()?;
+        let sample = audio.try_pull_sample(gst::ClockTime::from_seconds(5));
+        playback.set_state(gst::State::Null)?;
+        let sample = sample.expect("Ogg stream should decode to audio");
+        assert_eq!(
+            sample.caps().unwrap().structure(0).unwrap().name(),
+            "audio/x-raw"
+        );
+        assert!(sample.buffer().unwrap().size() > 0);
         Ok(())
     }
 }
