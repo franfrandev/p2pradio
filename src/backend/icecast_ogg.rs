@@ -204,6 +204,7 @@ impl Stream<StreamWithPipeline> {
                     }
                 }
                 _ = cancel.cancelled() => {
+                    tracing::warn!("Cancelled");
                     break;
                 }
             }
@@ -211,6 +212,7 @@ impl Stream<StreamWithPipeline> {
 
         tracing::debug!("Pipeline ended");
 
+        // TODO need to ensure this is called when cancelled at any point
         self.state.pipeline.set_state(gst::State::Null)?;
 
         Ok(())
@@ -219,7 +221,7 @@ impl Stream<StreamWithPipeline> {
     pub fn process_message(&self, msg: gstreamer::Message) -> Result<bool, Error> {
         use gst::MessageView;
 
-        tracing::debug!("Received message: {:?}", msg);
+        tracing::trace!("Received message: {:?}", msg);
 
         match msg.view() {
             MessageView::Eos(..) => return Ok(true),
