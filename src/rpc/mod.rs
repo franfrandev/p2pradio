@@ -3,32 +3,32 @@ use crate::p2p::codec::{Message, Metadata};
 use crate::rpc::info::InfoRpcServer;
 use crate::rpc::listener::ListenerRpcServer;
 use anyhow::Context as _;
+use axum::http::{HeaderMap, HeaderName};
+use axum::{Router, body::Body, extract::State, response::IntoResponse, routing::get};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt as _;
 use http_body_util::StreamBody;
 use http_body_util::combinators::BoxBody;
-use hyper::body::Frame;
-use hyper::header::CONTENT_TYPE;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper::{Request, Response, StatusCode};
+use hyper::{
+    Request, Response, StatusCode, body::Frame, header::CONTENT_TYPE, server::conn::http1,
+    service::service_fn,
+};
 use io::{AsyncRead, AsyncWrite};
-use jsonrpsee::core::RegisterMethodError;
-use jsonrpsee::server::{ServerBuilder, ServerHandle};
+use jsonrpsee::{
+    core::RegisterMethodError,
+    server::{ServerBuilder, ServerHandle},
+};
 use libp2p::PeerId;
 use pin_project_lite::pin_project;
-use std::net::SocketAddr;
-use std::sync::{Arc, RwLock};
+use prometheus_client::{encoding::text::encode as prometheus_encode, registry::Registry};
 use std::{
+    net::SocketAddr,
     pin::Pin,
+    sync::{Arc, Mutex, RwLock},
     task::{Context, Poll},
 };
 use thiserror::Error;
-use tokio::io::ReadBuf;
-use tokio::net::TcpListener;
-use tokio::sync::broadcast;
-use tokio::task::JoinHandle;
-use tokio::{io, select};
+use tokio::{io, io::ReadBuf, net::TcpListener, select, sync::broadcast, task::JoinHandle};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
@@ -109,11 +109,12 @@ impl ServerVariant {
 
     pub async fn start_rpc_server(
         self,
+        metric_registry: Registry,
         cancel: CancellationToken,
     ) -> Result<RunningServer, RpcError> {
         let (addr, handle) = match self {
             ServerVariant::Streamer { rpc_addr, peer_id } => {
-                start_streamer_server(rpc_addr, peer_id).await?
+                start_streamer_server(metric_registry, rpc_addr, peer_id, cancel).await?
             }
             ServerVariant::Listener {
                 rpc_addr,
@@ -121,9 +122,15 @@ impl ServerVariant {
                 peer_id,
                 gossip_rx,
             } => {
-                let (addr, h1, h2, handle) =
-                    start_listener_server(rpc_addr, listener_addr, peer_id, gossip_rx, cancel)
-                        .await?;
+                let (addr, h1, h2, handle) = start_listener_server(
+                    metric_registry,
+                    rpc_addr,
+                    listener_addr,
+                    peer_id,
+                    gossip_rx,
+                    cancel,
+                )
+                .await?;
                 tokio::spawn(async move {
                     select! {
                         _ = h1 => {},
@@ -152,8 +159,10 @@ impl RunningServer {
 }
 
 pub(crate) async fn start_streamer_server(
+    metrics_registry: Registry,
     rpc_addr: SocketAddr,
     peer_id: PeerId,
+    cancel: CancellationToken,
 ) -> Result<(SocketAddr, ServerHandle), RpcError> {
     let server = ServerBuilder::default().build(rpc_addr).await?;
     let addr = server.local_addr()?;
@@ -164,11 +173,25 @@ pub(crate) async fn start_streamer_server(
 
     tracing::info!("RPC server started at {}", addr);
 
+    let listener = TcpListener::bind("127.0.0.1:10231").await?;
+    let server_listener_handle = tokio::spawn(async move {
+        server_listener(
+            listener,
+            metrics_registry,
+            None,
+            OggHeaders::new(Mutex::new(Vec::new())),
+            Arc::new(RwLock::new(String::new())),
+            cancel,
+        )
+        .await
+    });
+
     Ok((addr, server_handle))
 }
 
 #[instrument(skip(peer_id, gossip_rx, cancel))]
 async fn start_listener_server(
+    metric_registry: Registry,
     rpc_addr: SocketAddr,
     listener_addr: SocketAddr,
     peer_id: PeerId,
@@ -190,7 +213,7 @@ async fn start_listener_server(
     let mut methods = info::InfoRpcImpl { peer_id }.into_rpc();
 
     let (server_listener_handle, backend, local_addr) =
-        start_server(listener_addr, gossip_rx, cancel).await?;
+        start_server(listener_addr, metric_registry, gossip_rx, cancel).await?;
     methods.merge(listener::ListenerRpcImpl { local_addr }.into_rpc())?;
 
     let server_handle = server.start(methods);
@@ -343,6 +366,7 @@ where
 #[instrument(skip(gossip_rx, cancel))]
 async fn start_server(
     listener_addr: SocketAddr,
+    metrics_registry: Registry,
     gossip_rx: flume::Receiver<Message>,
     cancel: CancellationToken,
 ) -> Result<
@@ -396,49 +420,153 @@ async fn start_server(
         res
     });
 
-    let server_listener_handle =
-        tokio::spawn(
-            async move { server_listener(listener, dec_tx, headers, title, cancel).await },
-        );
+    let server_listener_handle = tokio::spawn(async move {
+        server_listener(
+            listener,
+            metrics_registry,
+            Some(dec_tx),
+            headers,
+            title,
+            cancel,
+        )
+        .await
+    });
 
     Ok((server_listener_handle, backend, local_addr))
 }
 
 async fn server_listener(
     listener: TcpListener,
-    dec_tx: broadcast::Sender<Vec<u8>>,
+    metrics_registry: Registry,
+    dec_tx: Option<broadcast::Sender<Vec<u8>>>,
     headers: OggHeaders,
     title: Arc<RwLock<String>>,
     cancel: CancellationToken,
 ) -> Result<(), RpcError> {
-    loop {
-        select! {
-            Ok((stream, _)) = listener.accept() => {
-                tracing::debug!("Accepted connection: {:?}", stream.peer_addr());
-                let dec_tx2 = dec_tx.clone();
-                let title2 = title.clone();
-                let headers = headers.clone();
-                tokio::spawn(async move {
-                    // TODO get rid of that
-                    let io = TokioIo::new(stream);
-
-                    // TODO figure out lifetimes here instead of cloning
-                    if let Err(err) = http1::Builder::new()
-                        .serve_connection(
-                            io,
-                            service_fn(|req| async { response_stream(req, dec_tx2.clone(), &headers, title2.clone()).await }),
-                        )
-                        .await
-                    {
-                        tracing::debug!("Error serving connection: {:?}", err);
-                    }
-                });
-            }
-            _ = cancel.cancelled() => {
-                return Ok(());
-            }
+    select! {
+        _ = build_server(listener, metrics_registry, headers, dec_tx, title) => {
+            tracing::warn!("Server listener exited");
+            Ok(())
+        },
+        _ = cancel.cancelled() => {
+            Ok(())
         }
     }
+}
+
+async fn build_server(
+    listener: TcpListener,
+    metrics_registry: Registry,
+    headers: OggHeaders,
+    dec_tx: Option<broadcast::Sender<Vec<u8>>>,
+    title: Arc<RwLock<String>>,
+) -> Result<(), io::Error> {
+    let is_listener = dec_tx.is_some();
+
+    let service = StreamService::new(headers, dec_tx, title, metrics_registry);
+    let mut router = Router::new().route("/metrics", get(respond_with_metrics));
+
+    if is_listener {
+        router = router.route("/stream", get(stream_handler));
+    }
+
+    axum::serve(listener, router.with_state(service)).await?;
+    Ok(())
+}
+
+const METRICS_CONTENT_TYPE: &str = "application/openmetrics-text;charset=utf-8;version=1.0.0";
+
+type SharedRegistry = Arc<Mutex<Registry>>;
+
+async fn respond_with_metrics(state: State<StreamService>) -> impl IntoResponse {
+    let mut sink = String::new();
+    let reg = state.get_reg();
+    prometheus_encode(&mut sink, &reg.lock().unwrap()).unwrap();
+
+    (StatusCode::OK, [(CONTENT_TYPE, METRICS_CONTENT_TYPE)], sink)
+}
+
+#[derive(Clone)]
+pub(crate) struct StreamService {
+    headers: OggHeaders,
+    dec_tx: Option<broadcast::Sender<Vec<u8>>>,
+    title: Arc<RwLock<String>>,
+    reg: SharedRegistry,
+}
+
+impl StreamService {
+    fn new(
+        headers: OggHeaders,
+        dec_tx: Option<broadcast::Sender<Vec<u8>>>,
+        title: Arc<RwLock<String>>,
+        metrics_registry: Registry,
+    ) -> Self {
+        Self {
+            headers,
+            dec_tx,
+            title,
+            reg: Arc::new(Mutex::new(metrics_registry)),
+        }
+    }
+
+    fn get_state(&self) -> &OggHeaders {
+        &self.headers
+    }
+
+    fn get_dec_tx(&self) -> broadcast::Sender<Vec<u8>> {
+        self.dec_tx.clone().unwrap()
+    }
+
+    fn get_title(&self) -> Arc<RwLock<String>> {
+        self.title.clone()
+    }
+
+    fn get_reg(&self) -> SharedRegistry {
+        Arc::clone(&self.reg)
+    }
+}
+
+async fn stream_handler(
+    state: State<StreamService>,
+    req: axum::extract::Request,
+) -> impl IntoResponse {
+    let icy_requested = req.headers().get("Icy-MetaData").is_some_and(|v| v == "1");
+    // The muxer holds this same lock while caching and broadcasting headers.
+    // Subscribe atomically with the snapshot to avoid missing or duplicating them.
+    let headers = state.get_state();
+    let dec_tx = state.get_dec_tx();
+    let (headers, rx) = {
+        let headers = headers.lock().expect("headers lock poisoned");
+        (headers.clone(), dec_tx.subscribe())
+    };
+    let initial = futures_util::stream::iter(headers.into_iter().map(Ok));
+    let live = BroadcastStream::new(rx)
+        .map(|item| item.context("Audio receiver lagged; reconnect to restart the stream"));
+    let mut icy = IcyEncoder::new(ICY_METAINT);
+    let title = state.get_title();
+    let stream = initial.chain(live).map(move |item| {
+        item.map(|bytes| {
+            let bytes = if icy_requested {
+                icy.encode(&bytes, &title.read().expect("title lock poisoned"))
+            } else {
+                Bytes::from(bytes)
+            };
+            Frame::data(bytes)
+        })
+    });
+    let body = Body::new(StreamBody::new(stream));
+
+    let mut headers = HeaderMap::new();
+    headers.insert(CONTENT_TYPE, "audio/ogg".parse().unwrap());
+
+    if icy_requested {
+        headers.insert(
+            HeaderName::from_static("icy-metaint"),
+            ICY_METAINT.to_string().parse().unwrap(),
+        );
+    }
+
+    (StatusCode::OK, headers, body)
 }
 
 const ICY_METAINT: usize = 8192;

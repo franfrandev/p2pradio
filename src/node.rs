@@ -8,6 +8,8 @@ use crate::{
     rpc::{RpcError, ServerVariant},
 };
 use libp2p::gossipsub::IdentTopic;
+use prometheus_client::registry::Registry;
+use std::sync::{Arc, Mutex};
 use tokio::{select, sync::mpsc, task::JoinHandle};
 use tokio_util::sync::CancellationToken;
 
@@ -15,16 +17,18 @@ pub struct Node;
 
 impl Node {
     pub async fn run(cli: cli::Cli, cancel: CancellationToken) -> Result<JoinHandle<()>, AppError> {
-        let mut swarm = swarm::create_swarm()?;
-        let peer_id = *swarm.local_peer_id();
+        let mut metric_registry = Registry::default();
 
-        let rpc_addr = cli.http().into_socket_addr().await?;
-
+        let mut swarm = swarm::create_swarm(&mut metric_registry)?;
         let topic = cli
             .topic
+            .clone()
             .ok_or(AppError::Other("missing --topic".to_string()))?;
         let topic = IdentTopic::new(topic);
         tune_in(&mut swarm, &topic)?;
+
+        let peer_id = *swarm.local_peer_id();
+        let rpc_addr = cli.http().into_socket_addr().await?;
 
         let handle = match cli.command {
             Commands::Streamer(cli::Streamer { url }) => {
@@ -37,7 +41,9 @@ impl Node {
                 let variant = ServerVariant::streamer(rpc_addr, peer_id);
                 let cancel2 = cancel.clone();
                 let server = tokio::spawn(async move {
-                    let running_server = variant.start_rpc_server(cancel2.clone()).await?;
+                    let running_server = variant
+                        .start_rpc_server(metric_registry, cancel2.clone())
+                        .await?;
                     running_server.stopped(cancel2).await;
                     Ok::<(), RpcError>(())
                 });
@@ -72,7 +78,9 @@ impl Node {
                 let variant = ServerVariant::listener(rpc_addr, stream_addr, peer_id, gossip_rx);
                 let cancel2 = cancel.clone();
                 let server = tokio::spawn(async move {
-                    let running_server = variant.start_rpc_server(cancel2.clone()).await?;
+                    let running_server = variant
+                        .start_rpc_server(metric_registry, cancel2.clone())
+                        .await?;
                     running_server.stopped(cancel2).await;
                     Ok::<_, RpcError>(())
                 });
