@@ -1,39 +1,44 @@
-use crate::backend::{DecodingBackend, OggHeaders};
-use crate::p2p::codec::{Message, Metadata};
-use crate::rpc::info::InfoRpcServer;
-use crate::rpc::listener::ListenerRpcServer;
+use crate::{
+    AppError,
+    backend::{DecodingBackend, DecodingBackendCtx, OggHeaders},
+    metrics::global_registry,
+    p2p::codec::{Message, Metadata},
+    rpc::info::InfoRpcServer,
+    utils::{
+        AsyncService, Ctx, Service, TaskRet, handle_loop_cannot_fail_handle, handle_to_main_handle,
+    },
+};
 use anyhow::Context as _;
-use axum::http::{HeaderMap, HeaderName};
-use axum::{Router, body::Body, extract::State, response::IntoResponse, routing::get};
+use axum::{
+    Router,
+    body::Body,
+    extract::State,
+    http::{HeaderMap, HeaderName},
+    response::IntoResponse,
+    routing::get,
+};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt as _;
-use http_body_util::StreamBody;
-use http_body_util::combinators::BoxBody;
-use hyper::{
-    Request, Response, StatusCode, body::Frame, header::CONTENT_TYPE, server::conn::http1,
-    service::service_fn,
-};
-use io::{AsyncRead, AsyncWrite};
+use http_body_util::{StreamBody, combinators::BoxBody};
+use hyper::{Request, Response, StatusCode, body::Frame, header::CONTENT_TYPE};
 use jsonrpsee::{
     core::RegisterMethodError,
     server::{ServerBuilder, ServerHandle},
 };
 use libp2p::PeerId;
-use pin_project_lite::pin_project;
-use prometheus_client::{encoding::text::encode as prometheus_encode, registry::Registry};
+use prometheus_client::encoding::text::encode as prometheus_encode;
 use std::{
+    convert::Infallible,
     net::SocketAddr,
-    pin::Pin,
     sync::{Arc, Mutex, RwLock},
-    task::{Context, Poll},
 };
 use thiserror::Error;
-use tokio::{io, io::ReadBuf, net::TcpListener, select, sync::broadcast, task::JoinHandle};
+use tokio::{io, net::TcpListener, select, sync::broadcast, sync::mpsc};
 use tokio_stream::wrappers::BroadcastStream;
 use tokio_util::sync::CancellationToken;
-use tracing::instrument;
 
 mod info;
+mod json;
 mod listener;
 
 pub enum ServerType {
@@ -49,27 +54,6 @@ pub enum RpcError {
     Io(#[from] io::Error),
 }
 
-/// https://www.jsonrpc.org/specification#response_object
-pub mod err {
-    pub const PARSE_ERROR: i32 = -32700;
-    pub const INVALID_REQUEST: i32 = -32600;
-    pub const METHOD_NOT_FOUND: i32 = -32601;
-    pub const INVALID_PARAMS: i32 = -32602;
-    pub const INTERNAL_ERROR: i32 = -32603;
-
-    pub const fn server_error(code: i32) -> i32 {
-        if code >= -32099 && code <= -32000 {
-            code
-        } else {
-            panic!("Invalid server error code");
-        }
-    }
-
-    pub const FAILED_SEND_FILE_REF: i32 = server_error(-32099);
-    pub const FAILED_RECV_FILE_FEED: i32 = server_error(-32098);
-    pub const FILE_ERR: i32 = server_error(-32097);
-}
-
 pub enum ServerVariant {
     Streamer {
         rpc_addr: SocketAddr,
@@ -79,91 +63,102 @@ pub enum ServerVariant {
         rpc_addr: SocketAddr,
         stream_addr: SocketAddr,
         peer_id: PeerId,
-        gossip_rx: flume::Receiver<Message>,
+        gossip_rx: mpsc::Receiver<Message>,
     },
 }
 
-pub struct RunningServer {
-    pub addr: SocketAddr,
-    pub handle: ServerHandle,
+pub struct StreamerServerService {
+    server_listener: AxumServerStreamerService,
+    server_handle: ServerHandle,
+    cancel: CancellationToken,
 }
 
-impl ServerVariant {
-    pub fn streamer(rpc_addr: SocketAddr, peer_id: PeerId) -> ServerVariant {
-        ServerVariant::Streamer { rpc_addr, peer_id }
-    }
-
-    pub fn listener(
-        rpc_addr: SocketAddr,
-        stream_addr: SocketAddr,
-        peer_id: PeerId,
-        gossip_rx: flume::Receiver<Message>,
-    ) -> ServerVariant {
-        ServerVariant::Listener {
-            rpc_addr,
-            stream_addr,
-            peer_id,
-            gossip_rx,
-        }
-    }
-
-    pub async fn start_rpc_server(
-        self,
-        metric_registry: Registry,
-        cancel: CancellationToken,
-    ) -> Result<RunningServer, RpcError> {
-        let (addr, handle) = match self {
-            ServerVariant::Streamer { rpc_addr, peer_id } => {
-                start_streamer_server(metric_registry, rpc_addr, peer_id, cancel).await?
-            }
-            ServerVariant::Listener {
-                rpc_addr,
-                stream_addr: listener_addr,
-                peer_id,
-                gossip_rx,
-            } => {
-                let (addr, h1, h2, handle) = start_listener_server(
-                    metric_registry,
-                    rpc_addr,
-                    listener_addr,
-                    peer_id,
-                    gossip_rx,
-                    cancel,
-                )
-                .await?;
-                tokio::spawn(async move {
-                    select! {
-                        _ = h1 => {},
-                        _ = h2 => {},
-                    }
-                });
-                (addr, handle)
-            }
-        };
-
-        Ok(RunningServer { addr, handle })
-    }
+pub struct StreamerServerCtx {
+    pub(crate) rpc_addr: SocketAddr,
+    pub(crate) http_addr: SocketAddr,
+    pub(crate) peer_id: PeerId,
+    pub(crate) cancel: CancellationToken,
 }
 
-impl RunningServer {
-    pub fn addr(&self) -> SocketAddr {
-        self.addr
+impl Ctx for StreamerServerCtx {}
+
+impl AsyncService<StreamerServerCtx, AppError, AppError> for StreamerServerService {
+    async fn new(ctx: StreamerServerCtx) -> Result<Self, AppError>
+    where
+        Self: Sized,
+    {
+        let listener = TcpListener::bind(ctx.http_addr).await?;
+        let server_listener = AxumServerStreamerService::new(AxumServerStreamerCtx {
+            listener,
+            cancel: ctx.cancel.clone(),
+        })?;
+
+        let server_handle = start_info_server(ctx.rpc_addr, ctx.peer_id).await?;
+
+        Ok(StreamerServerService {
+            server_listener,
+            server_handle,
+            cancel: ctx.cancel,
+        })
     }
 
-    pub async fn stopped(self, cancel: CancellationToken) {
+    async fn run(self) -> TaskRet<AppError> {
+        let server_listener = self.server_listener;
+        let server_listener_handle = tokio::spawn(async move { server_listener.run().await });
+
         select! {
-            _ = self.handle.stopped() => {}
-            _ = cancel.cancelled() => {}
+            _ = self.server_handle.stopped() => Some(Err(AppError::TaskExited)),
+            res = server_listener_handle =>
+                handle_to_main_handle(res)
+            ,
+            _ = self.cancel.cancelled() => None,
         }
     }
 }
 
-pub(crate) async fn start_streamer_server(
-    metrics_registry: Registry,
+pub async fn create_listener_server(
+    rpc_addr: SocketAddr,
+    listener_addr: SocketAddr,
+    peer_id: PeerId,
+    gossip_sub_rx: mpsc::Receiver<Message>,
+    cancel: CancellationToken,
+) -> Result<ListenerServerService, AppError> {
+    let listener = TcpListener::bind(listener_addr).await?;
+    let listener_server = ListenerServerService::new(ListenerServerCtx {
+        gossip_sub_rx,
+        headers: Arc::new(Mutex::new(vec![])),
+        title: Arc::new(Default::default()),
+        listener,
+        rpc_addr,
+        peer_id,
+        cancel,
+    })
+    .await?;
+
+    Ok(listener_server)
+}
+
+pub struct ListenerServerService {
+    decoding_backend: DecodingBackend,
+    axum_server: AxumServerListenerService,
+    gossip_backend: GossipBackendBridge,
+    server_handle: ServerHandle,
+}
+
+pub struct ListenerServerCtx {
+    pub gossip_sub_rx: mpsc::Receiver<Message>,
+    pub headers: OggHeaders,
+    pub title: Arc<RwLock<String>>,
+    pub listener: TcpListener,
+    pub rpc_addr: SocketAddr,
+    pub peer_id: PeerId,
+    pub cancel: CancellationToken,
+}
+
+async fn start_info_server(
     rpc_addr: SocketAddr,
     peer_id: PeerId,
-    cancel: CancellationToken,
-) -> Result<(SocketAddr, ServerHandle), RpcError> {
+) -> Result<ServerHandle, AppError> {
     let server = ServerBuilder::default().build(rpc_addr).await?;
     let addr = server.local_addr()?;
 
@@ -173,314 +168,214 @@ pub(crate) async fn start_streamer_server(
 
     tracing::info!("RPC server started at {}", addr);
 
-    let listener = TcpListener::bind("127.0.0.1:10231").await?;
-    let server_listener_handle = tokio::spawn(async move {
-        server_listener(
-            listener,
-            metrics_registry,
-            None,
-            OggHeaders::new(Mutex::new(Vec::new())),
-            Arc::new(RwLock::new(String::new())),
-            cancel,
-        )
-        .await
-    });
-
-    Ok((addr, server_handle))
+    Ok(server_handle)
 }
 
-#[instrument(skip(peer_id, gossip_rx, cancel))]
-async fn start_listener_server(
-    metric_registry: Registry,
-    rpc_addr: SocketAddr,
-    listener_addr: SocketAddr,
-    peer_id: PeerId,
-    gossip_rx: flume::Receiver<Message>,
-    cancel: CancellationToken,
-) -> Result<
-    (
-        SocketAddr,
-        JoinHandle<Result<(), RpcError>>,
-        JoinHandle<Result<(), anyhow::Error>>,
-        ServerHandle,
-    ),
-    RpcError,
-> {
-    tracing::debug!("Starting JSON rpc server");
-    let server = ServerBuilder::default().build(rpc_addr).await?;
-    let addr = server.local_addr()?;
+impl Ctx for ListenerServerCtx {}
 
-    let mut methods = info::InfoRpcImpl { peer_id }.into_rpc();
+impl AsyncService<ListenerServerCtx, AppError, AppError> for ListenerServerService {
+    async fn new(ctx: ListenerServerCtx) -> Result<Self, AppError>
+    where
+        Self: Sized,
+    {
+        let (audio_tx, audio_rx) = mpsc::channel(100);
+        let (dec_tx, _) = broadcast::channel(100);
 
-    let (server_listener_handle, backend, local_addr) =
-        start_server(listener_addr, metric_registry, gossip_rx, cancel).await?;
-    methods.merge(listener::ListenerRpcImpl { local_addr }.into_rpc())?;
+        let headers = ctx.headers;
+        let decoding_backend = DecodingBackend::new(DecodingBackendCtx {
+            audio_rx,
+            dec_tx: dec_tx.clone(),
+            headers: headers.clone(),
+            cancel: ctx.cancel.clone(),
+        })
+        .await?;
 
-    let server_handle = server.start(methods);
+        let axum_server = AxumServerListenerService::new(AxumServerListenerCtx {
+            dec_tx,
+            headers,
+            title: ctx.title.clone(),
+            listener: ctx.listener,
+            cancel: ctx.cancel.clone(),
+        })?;
 
-    tracing::info!("RPC server started at {}", addr);
+        let gossip_backend = GossipBackendBridge::new(GossipBackendBridgeCtx {
+            gossip_sub_rx: ctx.gossip_sub_rx,
+            app_src_tx: audio_tx,
+            title: ctx.title,
+            cancel: ctx.cancel.clone(),
+        })?;
 
-    Ok((addr, server_listener_handle, backend, server_handle))
-}
+        let server_handle = start_info_server(ctx.rpc_addr, ctx.peer_id).await?;
 
-pin_project! {
-    #[derive(Debug)]
-    pub struct TokioIo<T> {
-        #[pin]
-        inner: T,
-    }
-}
-
-impl<T> TokioIo<T> {
-    pub fn new(inner: T) -> Self {
-        Self { inner }
+        Ok(Self {
+            decoding_backend,
+            axum_server,
+            gossip_backend,
+            server_handle,
+        })
     }
 
-    pub fn inner(self) -> T {
-        self.inner
-    }
-}
+    async fn run(self) -> TaskRet<AppError> {
+        let backend = tokio::spawn(async move { self.decoding_backend.run().await });
+        let axum_server = tokio::spawn(async move { self.axum_server.run().await });
+        let gossip_backend_bridge = tokio::spawn(async move { self.gossip_backend.run().await });
+        let server_handle = tokio::spawn(async move { self.server_handle.stopped().await });
 
-impl<T> hyper::rt::Read for TokioIo<T>
-where
-    T: AsyncRead,
-{
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        mut buf: hyper::rt::ReadBufCursor<'_>,
-    ) -> Poll<Result<(), io::Error>> {
-        let n = unsafe {
-            let mut tbuf = ReadBuf::uninit(buf.as_mut());
-            match AsyncRead::poll_read(self.project().inner, cx, &mut tbuf) {
-                Poll::Ready(Ok(())) => tbuf.filled().len(),
-                other => return other,
-            }
-        };
-
-        unsafe {
-            buf.advance(n);
+        select! {
+            res = backend => handle_to_main_handle(res),
+            res = axum_server => handle_to_main_handle(res),
+            res = gossip_backend_bridge => handle_loop_cannot_fail_handle(res),
+            _ = server_handle => Some(Err(AppError::TaskExited)),
         }
-        Poll::Ready(Ok(()))
     }
 }
 
-impl<T> hyper::rt::Write for TokioIo<T>
-where
-    T: AsyncWrite,
-{
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        AsyncWrite::poll_write(self.project().inner, cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        AsyncWrite::poll_flush(self.project().inner, cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        AsyncWrite::poll_shutdown(self.project().inner, cx)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        AsyncWrite::is_write_vectored(&self.inner)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Poll<Result<usize, io::Error>> {
-        AsyncWrite::poll_write_vectored(self.project().inner, cx, bufs)
-    }
-}
-
-impl<T> AsyncRead for TokioIo<T>
-where
-    T: hyper::rt::Read,
-{
-    fn poll_read(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        tbuf: &mut ReadBuf<'_>,
-    ) -> Poll<Result<(), io::Error>> {
-        //let init = tbuf.initialized().len();
-        let filled = tbuf.filled().len();
-        let sub_filled = unsafe {
-            let mut buf = hyper::rt::ReadBuf::uninit(tbuf.unfilled_mut());
-
-            match hyper::rt::Read::poll_read(self.project().inner, cx, buf.unfilled()) {
-                Poll::Ready(Ok(())) => buf.filled().len(),
-                other => return other,
-            }
-        };
-
-        let n_filled = filled + sub_filled;
-        // At least sub_filled bytes had to have been initialized.
-        let n_init = sub_filled;
-        unsafe {
-            tbuf.assume_init(n_init);
-            tbuf.set_filled(n_filled);
-        }
-
-        Poll::Ready(Ok(()))
-    }
-}
-
-impl<T> AsyncWrite for TokioIo<T>
-where
-    T: hyper::rt::Write,
-{
-    fn poll_write(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<Result<usize, io::Error>> {
-        hyper::rt::Write::poll_write(self.project().inner, cx, buf)
-    }
-
-    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        hyper::rt::Write::poll_flush(self.project().inner, cx)
-    }
-
-    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        hyper::rt::Write::poll_shutdown(self.project().inner, cx)
-    }
-
-    fn poll_write_vectored(
-        self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        bufs: &[std::io::IoSlice<'_>],
-    ) -> Poll<Result<usize, io::Error>> {
-        hyper::rt::Write::poll_write_vectored(self.project().inner, cx, bufs)
-    }
-
-    fn is_write_vectored(&self) -> bool {
-        hyper::rt::Write::is_write_vectored(&self.inner)
-    }
-}
-
-#[instrument(skip(gossip_rx, cancel))]
-async fn start_server(
-    listener_addr: SocketAddr,
-    metrics_registry: Registry,
-    gossip_rx: flume::Receiver<Message>,
+pub struct GossipBackendBridge {
+    gossip_sub_rx: mpsc::Receiver<Message>,
+    app_src_tx: mpsc::Sender<Vec<u8>>,
+    title: Arc<RwLock<String>>,
     cancel: CancellationToken,
-) -> Result<
-    (
-        JoinHandle<Result<(), RpcError>>,
-        JoinHandle<Result<(), anyhow::Error>>,
-        SocketAddr,
-    ),
-    RpcError,
-> {
-    tracing::debug!("Starting rpc server");
-    let listener = TcpListener::bind(listener_addr).await?;
-    let local_addr = listener.local_addr()?;
-    tracing::info!("Listening on {}", local_addr);
+}
 
-    let (dec_tx, _) = broadcast::channel(100);
-    let headers = OggHeaders::default();
+pub struct GossipBackendBridgeCtx {
+    pub gossip_sub_rx: mpsc::Receiver<Message>,
+    pub app_src_tx: mpsc::Sender<Vec<u8>>,
+    pub title: Arc<RwLock<String>>,
+    pub cancel: CancellationToken,
+}
 
-    let cancel_ = cancel.clone();
-    let (app_src_tx, app_src_rx) = flume::bounded(100);
-    let title = Arc::new(RwLock::new(String::new()));
+impl Ctx for GossipBackendBridgeCtx {}
 
-    let title2 = title.clone();
-    let cancel2 = cancel.clone();
-    tokio::spawn(async move {
-        loop {
-            select! {
-                Ok(msg) = gossip_rx.recv_async() => {
-                    match msg {
-                        Message::AudioPacket(bytes) => {
-                            app_src_tx.send_async(bytes).await.ok();
-                        }
-                        Message::Metadata(Metadata {title}) => {
-                            tracing::warn!("Received metadata: {}", title);
-                            *title2.write().unwrap() = title;
+impl Service<GossipBackendBridgeCtx, Infallible, Infallible> for GossipBackendBridge {
+    fn new(ctx: GossipBackendBridgeCtx) -> Result<Self, Infallible>
+    where
+        Self: Sized,
+    {
+        Ok(GossipBackendBridge {
+            gossip_sub_rx: ctx.gossip_sub_rx,
+            app_src_tx: ctx.app_src_tx,
+            title: ctx.title,
+            cancel: ctx.cancel,
+        })
+    }
+
+    async fn run(mut self) -> TaskRet<Infallible> {
+        self.cancel
+            .run_until_cancelled(async {
+                loop {
+                    if let Some(msg) = self.gossip_sub_rx.recv().await {
+                        match msg {
+                            Message::AudioPacket(bytes) => {
+                                self.app_src_tx.send(bytes).await.ok();
+                            }
+                            Message::Metadata(Metadata { title }) => {
+                                tracing::warn!("Received metadata: {}", title);
+                                *self.title.write().unwrap() = title;
+                            }
                         }
                     }
                 }
-                _ = cancel2.cancelled() => return
-            }
-        }
-    });
-
-    let dec_tx2 = dec_tx.clone();
-    let headers2 = headers.clone();
-    let backend = tokio::spawn(async move {
-        tracing::debug!("Starting decoding backend");
-        let back = DecodingBackend::new(app_src_rx, dec_tx2, headers2);
-        let res = back.run(cancel_).await;
-        tracing::error!("Backend finished with result: {:?}", res);
-        res
-    });
-
-    let server_listener_handle = tokio::spawn(async move {
-        server_listener(
-            listener,
-            metrics_registry,
-            Some(dec_tx),
-            headers,
-            title,
-            cancel,
-        )
-        .await
-    });
-
-    Ok((server_listener_handle, backend, local_addr))
+            })
+            .await
+    }
 }
 
-async fn server_listener(
+pub struct AxumServerListenerService {
     listener: TcpListener,
-    metrics_registry: Registry,
-    dec_tx: Option<broadcast::Sender<Vec<u8>>>,
-    headers: OggHeaders,
-    title: Arc<RwLock<String>>,
+    router: Router<StreamService>,
+    service: StreamService,
     cancel: CancellationToken,
-) -> Result<(), RpcError> {
-    select! {
-        _ = build_server(listener, metrics_registry, headers, dec_tx, title) => {
-            tracing::warn!("Server listener exited");
-            Ok(())
-        },
-        _ = cancel.cancelled() => {
-            Ok(())
-        }
+}
+
+pub struct AxumServerListenerCtx {
+    dec_tx: broadcast::Sender<Vec<u8>>,
+    headers: OggHeaders,
+    title: Arc<RwLock<String>>,
+    listener: TcpListener,
+    cancel: CancellationToken,
+}
+
+impl Ctx for AxumServerListenerCtx {}
+
+impl Service<AxumServerListenerCtx, Infallible, Infallible> for AxumServerListenerService {
+    fn new(ctx: AxumServerListenerCtx) -> Result<Self, Infallible>
+    where
+        Self: Sized,
+    {
+        let service = StreamService::new(ctx.headers, ctx.dec_tx, ctx.title);
+        let mut router = metrics_router();
+
+        router = router.route("/stream", get(stream_handler));
+
+        Ok(AxumServerListenerService {
+            listener: ctx.listener,
+            router,
+            service,
+            cancel: ctx.cancel,
+        })
+    }
+
+    async fn run(self) -> TaskRet<Infallible> {
+        self.cancel
+            .run_until_cancelled(async move {
+                axum::serve(self.listener, self.router.with_state(self.service))
+                    .await
+                    .unwrap();
+                unreachable!()
+            })
+            .await
     }
 }
 
-async fn build_server(
+pub struct AxumServerStreamerService {
     listener: TcpListener,
-    metrics_registry: Registry,
-    headers: OggHeaders,
-    dec_tx: Option<broadcast::Sender<Vec<u8>>>,
-    title: Arc<RwLock<String>>,
-) -> Result<(), io::Error> {
-    let is_listener = dec_tx.is_some();
+    router: Router,
+    cancel: CancellationToken,
+}
 
-    let service = StreamService::new(headers, dec_tx, title, metrics_registry);
-    let mut router = Router::new().route("/metrics", get(respond_with_metrics));
+pub struct AxumServerStreamerCtx {
+    listener: TcpListener,
+    cancel: CancellationToken,
+}
 
-    if is_listener {
-        router = router.route("/stream", get(stream_handler));
+impl Ctx for AxumServerStreamerCtx {}
+
+impl Service<AxumServerStreamerCtx, Infallible, Infallible> for AxumServerStreamerService {
+    fn new(ctx: AxumServerStreamerCtx) -> Result<Self, Infallible>
+    where
+        Self: Sized,
+    {
+        let router = metrics_router();
+
+        Ok(AxumServerStreamerService {
+            listener: ctx.listener,
+            router,
+            cancel: ctx.cancel,
+        })
     }
 
-    axum::serve(listener, router.with_state(service)).await?;
-    Ok(())
+    async fn run(self) -> TaskRet<Infallible> {
+        self.cancel
+            .run_until_cancelled(async move {
+                axum::serve(self.listener, self.router).await.unwrap();
+                unreachable!()
+            })
+            .await
+    }
+}
+
+fn metrics_router<S>() -> Router<S>
+where
+    S: Clone + Sync + Send + 'static,
+{
+    Router::new().route("/metrics", get(respond_with_metrics))
 }
 
 const METRICS_CONTENT_TYPE: &str = "application/openmetrics-text;charset=utf-8;version=1.0.0";
 
-type SharedRegistry = Arc<Mutex<Registry>>;
-
-async fn respond_with_metrics(state: State<StreamService>) -> impl IntoResponse {
+async fn respond_with_metrics() -> impl IntoResponse {
     let mut sink = String::new();
-    let reg = state.get_reg();
+    let reg = global_registry();
     prometheus_encode(&mut sink, &reg.lock().unwrap()).unwrap();
 
     (StatusCode::OK, [(CONTENT_TYPE, METRICS_CONTENT_TYPE)], sink)
@@ -489,23 +384,20 @@ async fn respond_with_metrics(state: State<StreamService>) -> impl IntoResponse 
 #[derive(Clone)]
 pub(crate) struct StreamService {
     headers: OggHeaders,
-    dec_tx: Option<broadcast::Sender<Vec<u8>>>,
+    dec_tx: broadcast::Sender<Vec<u8>>,
     title: Arc<RwLock<String>>,
-    reg: SharedRegistry,
 }
 
 impl StreamService {
     fn new(
         headers: OggHeaders,
-        dec_tx: Option<broadcast::Sender<Vec<u8>>>,
+        dec_tx: broadcast::Sender<Vec<u8>>,
         title: Arc<RwLock<String>>,
-        metrics_registry: Registry,
     ) -> Self {
         Self {
             headers,
             dec_tx,
             title,
-            reg: Arc::new(Mutex::new(metrics_registry)),
         }
     }
 
@@ -514,15 +406,11 @@ impl StreamService {
     }
 
     fn get_dec_tx(&self) -> broadcast::Sender<Vec<u8>> {
-        self.dec_tx.clone().unwrap()
+        self.dec_tx.clone()
     }
 
     fn get_title(&self) -> Arc<RwLock<String>> {
         self.title.clone()
-    }
-
-    fn get_reg(&self) -> SharedRegistry {
-        Arc::clone(&self.reg)
     }
 }
 

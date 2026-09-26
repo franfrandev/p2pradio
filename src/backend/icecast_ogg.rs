@@ -211,6 +211,7 @@ impl Stream<StreamWithPipeline> {
 
         tracing::debug!("Pipeline ended");
 
+        // TODO need to ensure this is called when cancelled at any point
         self.state.pipeline.set_state(gst::State::Null)?;
 
         Ok(())
