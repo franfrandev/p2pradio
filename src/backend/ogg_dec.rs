@@ -11,20 +11,19 @@ use gstreamer::element_error;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
 use tokio::select;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 use tracing::instrument;
 
 pub struct EmptyDecStream {
-    pub(crate) parsed_rx: flume::Receiver<Vec<u8>>,
+    pub(crate) parsed_rx: mpsc::Receiver<Vec<u8>>,
     pub(crate) dec_tx: broadcast::Sender<Vec<u8>>,
 }
 
 pub struct DecStreamWithPipeline {
-    pub(crate) parsed_rx: flume::Receiver<Vec<u8>>,
+    pub(crate) parsed_rx: mpsc::Receiver<Vec<u8>>,
     pub(crate) pipeline: gst::Pipeline,
     pub(crate) app_src: gst_app::AppSrc,
-    pub(crate) dec_tx: broadcast::Sender<Vec<u8>>,
 }
 
 pub struct DecStream<S> {
@@ -32,7 +31,7 @@ pub struct DecStream<S> {
 }
 
 pub fn new_empty_dec_stream(
-    parsed_rx: flume::Receiver<Vec<u8>>,
+    parsed_rx: mpsc::Receiver<Vec<u8>>,
     dec_tx: broadcast::Sender<Vec<u8>>,
 ) -> DecStream<EmptyDecStream> {
     DecStream {
@@ -43,7 +42,7 @@ pub fn new_empty_dec_stream(
 impl DecStream<DecStreamWithPipeline> {
     #[instrument(level = "debug", skip_all)]
     pub async fn run_dec_stream(
-        self: DecStream<DecStreamWithPipeline>,
+        mut self: DecStream<DecStreamWithPipeline>,
         cancel: CancellationToken,
     ) -> Result<(), Error> {
         tracing::debug!("Starting main loop");
@@ -84,13 +83,13 @@ impl DecStream<DecStreamWithPipeline> {
     }
 
     async fn run_loop(
-        &self,
+        &mut self,
         bus_stream: &mut BusStream,
         cancel: &CancellationToken,
     ) -> Result<bool, Error> {
         select! {
             Some(msg) = bus_stream.next() => process_message(msg),
-            Ok(bytes) = self.state.parsed_rx.recv_async() => process_bytes(&self.state.app_src, bytes),
+            Some(bytes) = self.state.parsed_rx.recv() => process_bytes(&self.state.app_src, bytes),
             _ = cancel.cancelled() => {
                 tracing::warn!("Cancelled in main_loop");
                 Ok(true)
@@ -273,7 +272,6 @@ impl DecStream<EmptyDecStream> {
                 parsed_rx: self.state.parsed_rx,
                 pipeline,
                 app_src,
-                dec_tx: self.state.dec_tx,
             },
         })
     }
@@ -306,7 +304,7 @@ mod tests {
             .expect("no sink")
             .downcast::<gst_app::AppSink>()
             .expect("not an appsink");
-        let (gossip_tx, gossip_rx) = flume::unbounded();
+        let (gossip_tx, gossip_rx) = mpsc::channel(100);
         sink.set_callbacks(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |appsink| {

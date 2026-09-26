@@ -7,10 +7,12 @@ mod icecast_ogg;
 mod ogg_dec;
 
 use crate::backend::icecast_ogg::new_empty_stream;
-use crate::backend::ogg_dec::new_empty_dec_stream;
+use crate::backend::ogg_dec::{DecStream, DecStreamWithPipeline, new_empty_dec_stream};
 use crate::p2p::codec::{Message, Metadata};
-use anyhow::Context;
+use crate::utils::{AsyncService, Ctx, Service, TaskRet};
+use anyhow::{Context, anyhow};
 use gstreamer_app::gst;
+use std::convert::Infallible;
 use std::{
     sync::{Arc, Mutex},
     time::Duration,
@@ -34,25 +36,43 @@ pub fn init_gst() -> anyhow::Result<()> {
 pub struct EncodingBackend {
     gossip_tx: mpsc::Sender<Message>,
     url: String,
+    cancel: CancellationToken,
+}
+
+pub struct EncodingBackendCtx {
+    pub(crate) gossip_tx: mpsc::Sender<Message>,
+    pub(crate) url: String,
+    pub(crate) cancel: CancellationToken,
+}
+
+impl Service<EncodingBackendCtx, Infallible, Infallible> for EncodingBackend {
+    fn new(ctx: EncodingBackendCtx) -> Result<Self, Infallible>
+    where
+        Self: Sized,
+    {
+        Ok(Self {
+            gossip_tx: ctx.gossip_tx,
+            url: ctx.url,
+            cancel: ctx.cancel,
+        })
+    }
+
+    async fn run(self) -> TaskRet<Infallible> {
+        init_gst().expect("Failed to initialize GStreamer");
+        let cancel = self.cancel.clone();
+        self.cancel
+            .run_until_cancelled(async {
+                loop {
+                    if let Err(err) = self.process_url(cancel.clone()).await {
+                        tracing::error!("Error processing url: {}", err)
+                    }
+                }
+            })
+            .await
+    }
 }
 
 impl EncodingBackend {
-    pub fn new(gossip_tx: mpsc::Sender<Message>, url: String) -> Self {
-        Self { gossip_tx, url }
-    }
-
-    pub async fn start(self, cancel: CancellationToken) {
-        init_gst().expect("Failed to initialize GStreamer");
-        loop {
-            select! {
-                Err(err) = self.process_url(cancel.clone()) => {
-                    tracing::error!("Error processing url: {}", err)
-                }
-                _ = cancel.cancelled() => break,
-            }
-        }
-    }
-
     async fn process_url(&self, cancel: CancellationToken) -> Result<(), String> {
         let url = self.url.clone();
         tracing::debug!("Processing url: {}", url);
@@ -98,33 +118,55 @@ impl EncodingBackend {
 pub type OggHeaders = Arc<Mutex<Vec<Vec<u8>>>>;
 
 pub struct DecodingBackend {
-    gossip_rx: flume::Receiver<Vec<u8>>,
-    dec_tx: broadcast::Sender<Vec<u8>>,
-    headers: OggHeaders,
+    dec_stream_with_pipeline: DecStream<DecStreamWithPipeline>,
+    cancel: CancellationToken,
 }
 
-impl DecodingBackend {
-    pub fn new(
-        gossip_rx: flume::Receiver<Vec<u8>>,
-        dec_tx: broadcast::Sender<Vec<u8>>,
-        headers: OggHeaders,
-    ) -> Self {
-        Self {
-            gossip_rx,
-            dec_tx,
-            headers,
-        }
+pub struct DecodingBackendCtx {
+    pub audio_rx: mpsc::Receiver<Vec<u8>>,
+    pub dec_tx: broadcast::Sender<Vec<u8>>,
+    pub headers: OggHeaders,
+    pub cancel: CancellationToken,
+}
+
+impl Ctx for DecodingBackendCtx {}
+
+impl AsyncService<DecodingBackendCtx, anyhow::Error, anyhow::Error> for DecodingBackend {
+    async fn new(ctx: DecodingBackendCtx) -> Result<Self, anyhow::Error>
+    where
+        Self: Sized,
+    {
+        init_gst().expect("Failed to initialize GStreamer");
+        let empty_dec_stream = new_empty_dec_stream(ctx.audio_rx, ctx.dec_tx);
+        let dec_stream_with_pipeline = timeout(
+            Duration::from_secs(10),
+            empty_dec_stream.create_opus_pipeline(ctx.headers),
+        )
+        .await
+        .context("pipeline not created after 10s")??;
+        tracing::debug!("pipeline created");
+
+        Ok(Self {
+            dec_stream_with_pipeline,
+            cancel: ctx.cancel,
+        })
     }
 
-    pub async fn run(self, cancel: CancellationToken) -> Result<(), anyhow::Error> {
-        init_gst()?;
-        let empty_dec_stream = new_empty_dec_stream(self.gossip_rx, self.dec_tx);
-        let dec_stream_with_pipeline =
-            // timeout(Duration::from_secs(10), empty_dec_stream.create_pipeline())
-            timeout(Duration::from_secs(10), empty_dec_stream.create_opus_pipeline(self.headers))
-                .await
-                .context("pipeline not created after 10s")??;
-        tracing::debug!("pipeline created");
-        dec_stream_with_pipeline.run_dec_stream(cancel).await
+    async fn run(self) -> TaskRet<anyhow::Error> {
+        let cancel = self.cancel.clone();
+        self.cancel
+            .run_until_cancelled(async {
+                let res = self
+                    .dec_stream_with_pipeline
+                    .run_dec_stream(cancel)
+                    .await
+                    .map_err(Into::into);
+                let res = match res {
+                    Ok(()) => anyhow!("Pipeline finished unexpectedly"),
+                    Err(e) => e,
+                };
+                Err(res)
+            })
+            .await
     }
 }

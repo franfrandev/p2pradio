@@ -8,6 +8,7 @@ pub trait ListenerRpc {
     async fn local_addr(&self) -> RpcResult<SocketAddr>;
 }
 
+#[allow(unused)]
 pub struct ListenerRpcImpl {
     pub local_addr: SocketAddr,
 }
