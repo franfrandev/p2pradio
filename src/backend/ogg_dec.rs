@@ -58,7 +58,7 @@ impl DecStream<DecStreamWithPipeline> {
 
         bus.add_signal_watch();
         bus.connect_message(None, |_, msg| {
-            tracing::warn!("Received message: {:?}", msg);
+            tracing::trace!("Received message: {:?}", msg);
         });
 
         let mut bus_stream = bus.stream();
@@ -101,7 +101,7 @@ impl DecStream<DecStreamWithPipeline> {
 pub fn process_message(msg: gstreamer::Message) -> Result<bool, Error> {
     use gst::MessageView;
 
-    tracing::debug!("Received message: {:?}", msg);
+    tracing::trace!("Received message: {:?}", msg);
 
     match msg.view() {
         MessageView::Eos(..) => return Ok(true),

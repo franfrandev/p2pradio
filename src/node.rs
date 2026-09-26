@@ -51,7 +51,7 @@ impl AsyncService<StreamerNodeCtx, AppError, AppError> for StreamerNode {
         let backend = EncodingBackend::new(EncodingBackendCtx {
             gossip_tx: gossip_pub_tx,
             url: ctx.url,
-            cancel: ctx.cancel.clone(),
+            cancel: ctx.cancel,
         })?;
 
         Ok(StreamerNode {
@@ -69,7 +69,7 @@ impl AsyncService<StreamerNodeCtx, AppError, AppError> for StreamerNode {
         select! {
             res = swarm => handle_loop_cannot_fail_handle(res),
             res = server => handle_to_main_handle(res),
-            res = backend => handle_loop_cannot_fail_handle(res),
+            res = backend => handle_to_main_handle(res),
         }
     }
 }

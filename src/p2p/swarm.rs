@@ -77,7 +77,7 @@ impl Service<StreamerSwarmCtx, AppError, Infallible> for StreamerSwarmService {
                     let data = msg.encode();
                     tracing::trace!("received data to publish: {} bytes", data.len());
                     if let Err(err) = publish_data(&mut self.swarm, self.topic.clone(), data) {
-                        tracing::debug!("Failed to publish data: {err}");
+                        tracing::trace!("Failed to publish data: {err}");
                     }
                 },
                 event = self.swarm.select_next_some() => process_streamer_event(&mut self.swarm, event).await,
